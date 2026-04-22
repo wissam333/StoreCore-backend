@@ -31,7 +31,6 @@ app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "10mb" }));
 
 // Auth middleware — skip /health and /license/* routes
-// Validates Bearer token against the licenses table (key column)
 app.use(async (req, res, next) => {
   if (req.path === "/health" || req.path.startsWith("/license")) return next();
 
@@ -52,13 +51,12 @@ app.use(async (req, res, next) => {
     if (lic.expires_at && new Date(lic.expires_at) < new Date())
       return res.status(401).json({ ok: false, error: "License expired" });
 
-    // Must be activated on at least one device
     if (!lic.machine_id_desktop && !lic.machine_id_mobile)
       return res
         .status(401)
         .json({ ok: false, error: "License not activated" });
 
-    req.licenseKey = token; // available downstream if needed
+    req.licenseKey = token;
     next();
   } catch (err) {
     console.error("Auth middleware error:", err.message);
@@ -77,6 +75,26 @@ const ALLOWED_TABLES = new Set([
   "staff",
 ]);
 
+// Pull order matters: parent tables must come before child tables so that
+// clients applying rows sequentially never hit a missing foreign key.
+//
+//   categories  (no deps)
+//   customers   (no deps)
+//   staff       (no deps)
+//   products    → categories
+//   orders      → customers
+//   order_items → orders, products
+//   dues        → customers, orders
+const TABLE_PULL_ORDER = [
+  "categories",
+  "customers",
+  "staff",
+  "products",
+  "orders",
+  "order_items",
+  "dues",
+];
+
 function guardTable(name, res) {
   if (!ALLOWED_TABLES.has(name)) {
     res.status(400).json({ ok: false, error: `Unknown table: ${name}` });
@@ -91,6 +109,8 @@ app.get("/health", (_req, res) =>
 );
 
 // ── PULL: GET /changes?since=ISO&limit=200&offset=0 ───────────────────────────
+// Tables are queried in dependency order (parents before children) so the
+// client can apply rows sequentially without FK violations.
 app.get("/changes", async (req, res) => {
   try {
     const since = req.query.since ?? "1970-01-01T00:00:00.000Z";
@@ -98,21 +118,20 @@ app.get("/changes", async (req, res) => {
     const offset = parseInt(req.query.offset ?? "0");
 
     const rows = [];
-    await Promise.all(
-      [...ALLOWED_TABLES].map(async (table) => {
-        const result = await pool.query(
-          `SELECT * FROM "${table}" WHERE updated_at > $1 ORDER BY updated_at ASC LIMIT $2 OFFSET $3`,
-          [since, limit, offset],
-        );
-        for (const row of result.rows) rows.push({ table, row });
-      }),
-    );
 
-    rows.sort(
-      (a, b) => new Date(a.row.updated_at) - new Date(b.row.updated_at),
-    );
+    // Sequential — preserves FK dependency order
+    for (const table of TABLE_PULL_ORDER) {
+      const result = await pool.query(
+        `SELECT * FROM "${table}" WHERE updated_at > $1 ORDER BY updated_at ASC LIMIT $2 OFFSET $3`,
+        [since, limit, offset],
+      );
+      for (const row of result.rows) rows.push({ table, row });
+    }
 
-    res.json({ ok: true, rows, hasMore: rows.length >= limit });
+    // hasMore: true if any table returned a full page
+    const hasMore = rows.length >= limit;
+
+    res.json({ ok: true, rows, hasMore });
   } catch (err) {
     console.error("GET /changes:", err.message);
     res.status(500).json({ ok: false, error: err.message });
