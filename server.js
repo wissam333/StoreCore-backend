@@ -164,11 +164,12 @@ app.delete("/:table/:id", async (req, res) => {
 
 // POST /license/activate
 app.post("/license/activate", async (req, res) => {
-  const { key, machine_id } = req.body;
-  if (!key || !machine_id)
+  const { key, machine_id, platform } = req.body;
+  // platform = 'desktop' | 'mobile'
+  if (!key || !machine_id || !platform)
     return res
       .status(400)
-      .json({ ok: false, error: "Missing key or machine_id" });
+      .json({ ok: false, error: "Missing key, machine_id or platform" });
 
   try {
     const { rows } = await pool.query("SELECT * FROM licenses WHERE key = $1", [
@@ -182,13 +183,24 @@ app.post("/license/activate", async (req, res) => {
       return res.status(403).json({ ok: false, error: "License deactivated" });
     if (lic.expires_at && new Date(lic.expires_at) < new Date())
       return res.status(403).json({ ok: false, error: "License expired" });
-    if (lic.machine_id && lic.machine_id !== machine_id)
+
+    const col =
+      platform === "mobile" ? "machine_id_mobile" : "machine_id_desktop";
+    const col_at =
+      platform === "mobile" ? "activated_at_mobile" : "activated_at_desktop";
+    const current = lic[col];
+
+    // Already bound to a different device
+    if (current && current !== machine_id)
       return res
         .status(403)
-        .json({ ok: false, error: "License already used on another device" });
+        .json({
+          ok: false,
+          error: `License already activated on another ${platform} device`,
+        });
 
     await pool.query(
-      "UPDATE licenses SET machine_id = $1, activated_at = NOW() WHERE key = $2",
+      `UPDATE licenses SET ${col} = $1, ${col_at} = NOW() WHERE key = $2`,
       [machine_id, key],
     );
 
@@ -200,11 +212,11 @@ app.post("/license/activate", async (req, res) => {
 
 // POST /license/verify
 app.post("/license/verify", async (req, res) => {
-  const { key, machine_id } = req.body;
-  if (!key || !machine_id)
+  const { key, machine_id, platform } = req.body;
+  if (!key || !machine_id || !platform)
     return res
       .status(400)
-      .json({ ok: false, error: "Missing key or machine_id" });
+      .json({ ok: false, error: "Missing key, machine_id or platform" });
 
   try {
     const { rows } = await pool.query("SELECT * FROM licenses WHERE key = $1", [
@@ -216,12 +228,21 @@ app.post("/license/verify", async (req, res) => {
       return res.status(404).json({ ok: false, error: "Invalid license key" });
     if (!lic.is_active)
       return res.status(403).json({ ok: false, error: "License deactivated" });
-    if (lic.machine_id !== machine_id)
+    if (lic.expires_at && new Date(lic.expires_at) < new Date())
+      return res.status(403).json({ ok: false, error: "License expired" });
+
+    const col =
+      platform === "mobile" ? "machine_id_mobile" : "machine_id_desktop";
+    const current = lic[col];
+
+    if (!current)
+      return res
+        .status(403)
+        .json({ ok: false, error: "Not activated on this platform yet" });
+    if (current !== machine_id)
       return res
         .status(403)
         .json({ ok: false, error: "License not valid for this device" });
-    if (lic.expires_at && new Date(lic.expires_at) < new Date())
-      return res.status(403).json({ ok: false, error: "License expired" });
 
     res.json({ ok: true, expires_at: lic.expires_at });
   } catch (err) {
@@ -231,8 +252,8 @@ app.post("/license/verify", async (req, res) => {
 
 // POST /license/deactivate — release machine so user can move to new PC
 app.post("/license/deactivate", async (req, res) => {
-  const { key, machine_id } = req.body;
-  if (!key || !machine_id)
+  const { key, machine_id, platform } = req.body;
+  if (!key || !platform)
     return res.status(400).json({ ok: false, error: "Missing fields" });
 
   try {
@@ -240,13 +261,18 @@ app.post("/license/deactivate", async (req, res) => {
       key,
     ]);
     const lic = rows[0];
-
     if (!lic) return res.status(404).json({ ok: false, error: "Invalid key" });
-    if (lic.machine_id !== machine_id)
+
+    const col =
+      platform === "mobile" ? "machine_id_mobile" : "machine_id_desktop";
+    const col_at =
+      platform === "mobile" ? "activated_at_mobile" : "activated_at_desktop";
+
+    if (lic[col] && lic[col] !== machine_id)
       return res.status(403).json({ ok: false, error: "Not your license" });
 
     await pool.query(
-      "UPDATE licenses SET machine_id = NULL, activated_at = NULL WHERE key = $1",
+      `UPDATE licenses SET ${col} = NULL, ${col_at} = NULL WHERE key = $1`,
       [key],
     );
 
