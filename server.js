@@ -4,8 +4,7 @@
 //
 // ENV variables required:
 //   DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS
-//   SYNC_TOKEN   — Bearer token clients must send
-//   PORT         — defaults to 3001
+//   PORT — defaults to 3001
 
 import dotenv from "dotenv";
 dotenv.config();
@@ -32,14 +31,39 @@ app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "10mb" }));
 
 // Auth middleware — skip /health and /license/* routes
-app.use((req, res, next) => {
+// Validates Bearer token against the licenses table (key column)
+app.use(async (req, res, next) => {
   if (req.path === "/health" || req.path.startsWith("/license")) return next();
+
   const auth = req.headers["authorization"] ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-  if (process.env.SYNC_TOKEN && token !== process.env.SYNC_TOKEN) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+  if (!token) return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+  try {
+    const { rows } = await pool.query(`SELECT * FROM licenses WHERE key = $1`, [
+      token,
+    ]);
+    const lic = rows[0];
+
+    if (!lic || !lic.is_active)
+      return res.status(401).json({ ok: false, error: "Unauthorized" });
+
+    if (lic.expires_at && new Date(lic.expires_at) < new Date())
+      return res.status(401).json({ ok: false, error: "License expired" });
+
+    // Must be activated on at least one device
+    if (!lic.machine_id_desktop && !lic.machine_id_mobile)
+      return res
+        .status(401)
+        .json({ ok: false, error: "License not activated" });
+
+    req.licenseKey = token; // available downstream if needed
+    next();
+  } catch (err) {
+    console.error("Auth middleware error:", err.message);
+    return res.status(500).json({ ok: false, error: "Auth check failed" });
   }
-  next();
 });
 
 // ── Whitelist of synced tables ────────────────────────────────────────────────
@@ -67,7 +91,6 @@ app.get("/health", (_req, res) =>
 );
 
 // ── PULL: GET /changes?since=ISO&limit=200&offset=0 ───────────────────────────
-// Returns rows from all synced tables updated after `since`.
 app.get("/changes", async (req, res) => {
   try {
     const since = req.query.since ?? "1970-01-01T00:00:00.000Z";
@@ -85,7 +108,6 @@ app.get("/changes", async (req, res) => {
       }),
     );
 
-    // Sort all rows by updated_at so client applies them in order
     rows.sort(
       (a, b) => new Date(a.row.updated_at) - new Date(b.row.updated_at),
     );
@@ -138,7 +160,6 @@ app.post("/:table", async (req, res) => {
 app.put("/:table/:id", async (req, res) => {
   const { table, id } = req.params;
   if (!guardTable(table, res)) return;
-  // Merge id from URL in case body omits it
   await upsertRow(table, { ...req.body, id: Number(id) }, res);
 });
 
@@ -165,7 +186,6 @@ app.delete("/:table/:id", async (req, res) => {
 // POST /license/activate
 app.post("/license/activate", async (req, res) => {
   const { key, machine_id, platform } = req.body;
-  // platform = 'desktop' | 'mobile'
   if (!key || !machine_id || !platform)
     return res
       .status(400)
@@ -190,14 +210,11 @@ app.post("/license/activate", async (req, res) => {
       platform === "mobile" ? "activated_at_mobile" : "activated_at_desktop";
     const current = lic[col];
 
-    // Already bound to a different device
     if (current && current !== machine_id)
-      return res
-        .status(403)
-        .json({
-          ok: false,
-          error: `License already activated on another ${platform} device`,
-        });
+      return res.status(403).json({
+        ok: false,
+        error: `License already activated on another ${platform} device`,
+      });
 
     await pool.query(
       `UPDATE licenses SET ${col} = $1, ${col_at} = NOW() WHERE key = $2`,
@@ -250,7 +267,7 @@ app.post("/license/verify", async (req, res) => {
   }
 });
 
-// POST /license/deactivate — release machine so user can move to new PC
+// POST /license/deactivate
 app.post("/license/deactivate", async (req, res) => {
   const { key, machine_id, platform } = req.body;
   if (!key || !platform)
