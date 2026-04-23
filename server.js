@@ -1,10 +1,4 @@
 // sync-backend/server.js
-// Store App sync backend — Express + PostgreSQL
-// Handles: push (POST/PUT/DELETE), pull (GET /changes), license management.
-//
-// ENV variables required:
-//   DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS
-//   PORT — defaults to 3001
 
 import dotenv from "dotenv";
 dotenv.config();
@@ -16,7 +10,6 @@ import cors from "cors";
 const { Pool } = pg;
 const app = express();
 
-// ── DB pool ───────────────────────────────────────────────────────────────────
 const pool = new Pool({
   host: process.env.DB_HOST,
   port: parseInt(process.env.DB_PORT ?? "5432"),
@@ -26,45 +19,43 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// ── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "10mb" }));
 
-// Auth middleware — skip /health and /license/* routes
+// ── Auth ──────────────────────────────────────────────────────────────────────
+// Only checks: key is known, active, and not expired.
+// machine_id is NOT checked here — that's the job of /license/verify.
+// Reason: after a reinstall the device activates → sync must work immediately.
+// If we checked machine_id here, the first sync after a fresh install on a
+// new device would fail until /verify was separately called.
 app.use(async (req, res, next) => {
   if (req.path === "/health" || req.path.startsWith("/license")) return next();
 
   const auth = req.headers["authorization"] ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-
   if (!token) return res.status(401).json({ ok: false, error: "Unauthorized" });
 
   try {
-    const { rows } = await pool.query(`SELECT * FROM licenses WHERE key = $1`, [
-      token,
-    ]);
+    const { rows } = await pool.query(
+      `SELECT key, is_active, expires_at FROM licenses WHERE key = $1`,
+      [token],
+    );
     const lic = rows[0];
 
     if (!lic || !lic.is_active)
       return res.status(401).json({ ok: false, error: "Unauthorized" });
-
     if (lic.expires_at && new Date(lic.expires_at) < new Date())
       return res.status(401).json({ ok: false, error: "License expired" });
-
-    if (!lic.machine_id_desktop && !lic.machine_id_mobile)
-      return res
-        .status(401)
-        .json({ ok: false, error: "License not activated" });
 
     req.licenseKey = token;
     next();
   } catch (err) {
-    console.error("Auth middleware error:", err.message);
+    console.error("Auth error:", err.message);
     return res.status(500).json({ ok: false, error: "Auth check failed" });
   }
 });
 
-// ── Whitelist of synced tables ────────────────────────────────────────────────
+// ── Tables & column whitelist ─────────────────────────────────────────────────
 const ALLOWED_TABLES = new Set([
   "categories",
   "products",
@@ -75,16 +66,8 @@ const ALLOWED_TABLES = new Set([
   "staff",
 ]);
 
-// Pull order matters: parent tables must come before child tables so that
-// clients applying rows sequentially never hit a missing foreign key.
-//
-//   categories  (no deps)
-//   customers   (no deps)
-//   staff       (no deps)
-//   products    → categories
-//   orders      → customers
-//   order_items → orders, products
-//   dues        → customers, orders
+// Parent-before-child order for /changes pull — client applies in this order
+// so FK refs are always satisfied.
 const TABLE_PULL_ORDER = [
   "categories",
   "customers",
@@ -95,22 +78,134 @@ const TABLE_PULL_ORDER = [
   "dues",
 ];
 
-function guardTable(name, res) {
+// Only real stored columns — strips computed JOIN columns like category_name,
+// customer_name, item_count, current_stock that the local IPC adds via SELECT.
+const TABLE_COLUMNS = {
+  categories: new Set([
+    "id",
+    "name",
+    "description",
+    "created_at",
+    "updated_at",
+    "_deleted",
+    "synced_at",
+  ]),
+  products: new Set([
+    "id",
+    "name",
+    "description",
+    "category_id",
+    "barcode",
+    "buy_price",
+    "sell_price",
+    "currency",
+    "stock",
+    "min_stock",
+    "unit",
+    "image_url",
+    "is_active",
+    "created_at",
+    "updated_at",
+    "_deleted",
+    "synced_at",
+  ]),
+  customers: new Set([
+    "id",
+    "name",
+    "phone",
+    "address",
+    "notes",
+    "total_orders",
+    "total_spent",
+    "last_order",
+    "created_at",
+    "updated_at",
+    "_deleted",
+    "synced_at",
+  ]),
+  orders: new Set([
+    "id",
+    "customer_id",
+    "order_date",
+    "status",
+    "total_sp",
+    "total_usd",
+    "paid_amount",
+    "display_currency",
+    "notes",
+    "created_at",
+    "updated_at",
+    "_deleted",
+    "synced_at",
+  ]),
+  order_items: new Set([
+    "id",
+    "order_id",
+    "product_id",
+    "product_name",
+    "quantity",
+    "sell_price_at_sale",
+    "currency_at_sale",
+    "line_total_sp",
+    "created_at",
+    "updated_at",
+    "_deleted",
+    "synced_at",
+  ]),
+  dues: new Set([
+    "id",
+    "customer_id",
+    "order_id",
+    "amount",
+    "currency",
+    "amount_sp",
+    "description",
+    "due_date",
+    "paid",
+    "paid_at",
+    "created_at",
+    "updated_at",
+    "_deleted",
+    "synced_at",
+  ]),
+  staff: new Set([
+    "id",
+    "full_name",
+    "username",
+    "password",
+    "role",
+    "phone",
+    "email",
+    "is_active",
+    "created_at",
+    "updated_at",
+    "_deleted",
+    "synced_at",
+  ]),
+};
+
+const stripRow = (table, row) => {
+  const allowed = TABLE_COLUMNS[table];
+  if (!allowed) return row;
+  return Object.fromEntries(
+    Object.entries(row).filter(([k]) => allowed.has(k)),
+  );
+};
+
+const guardTable = (name, res) => {
   if (!ALLOWED_TABLES.has(name)) {
     res.status(400).json({ ok: false, error: `Unknown table: ${name}` });
     return false;
   }
   return true;
-}
+};
 
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) =>
   res.json({ ok: true, ts: new Date().toISOString() }),
 );
 
-// ── PULL: GET /changes?since=ISO&limit=200&offset=0 ───────────────────────────
-// Tables are queried in dependency order (parents before children) so the
-// client can apply rows sequentially without FK violations.
+// ── PULL ──────────────────────────────────────────────────────────────────────
 app.get("/changes", async (req, res) => {
   try {
     const since = req.query.since ?? "1970-01-01T00:00:00.000Z";
@@ -118,36 +213,37 @@ app.get("/changes", async (req, res) => {
     const offset = parseInt(req.query.offset ?? "0");
 
     const rows = [];
-
-    // Sequential — preserves FK dependency order
+    // Sequential in FK order — parents always come before children
     for (const table of TABLE_PULL_ORDER) {
       const result = await pool.query(
         `SELECT * FROM "${table}" WHERE updated_at > $1 ORDER BY updated_at ASC LIMIT $2 OFFSET $3`,
         [since, limit, offset],
       );
-      for (const row of result.rows) rows.push({ table, row });
+      for (const row of result.rows) {
+        if (table === "staff") delete row.password; // never send passwords
+        rows.push({ table, row });
+      }
     }
 
-    // hasMore: true if any table returned a full page
-    const hasMore = rows.length >= limit;
-
-    res.json({ ok: true, rows, hasMore });
+    res.json({ ok: true, rows, hasMore: rows.length >= limit });
   } catch (err) {
     console.error("GET /changes:", err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// ── UPSERT helper ─────────────────────────────────────────────────────────────
-async function upsertRow(table, row, res) {
+// ── UPSERT ────────────────────────────────────────────────────────────────────
+async function upsertRow(table, rawRow, res) {
   try {
-    if (!row || !row.id) {
+    if (!rawRow || rawRow.id === undefined || rawRow.id === null)
       return res.status(400).json({ ok: false, error: "Missing row.id" });
-    }
 
+    const row = stripRow(table, rawRow); // remove computed columns
     const cols = Object.keys(row).filter((k) => k !== "synced_at");
-    const vals = cols.map((k) => row[k]);
+    if (cols.length === 0)
+      return res.status(400).json({ ok: false, error: "No valid columns" });
 
+    const vals = cols.map((k) => row[k]);
     const colList = cols.map((c) => `"${c}"`).join(", ");
     const placeholders = cols.map((_, i) => `$${i + 1}`).join(", ");
     const setClauses = cols
@@ -155,11 +251,23 @@ async function upsertRow(table, row, res) {
       .map((c) => `"${c}" = EXCLUDED."${c}"`)
       .join(", ");
 
-    await pool.query(
-      `INSERT INTO "${table}" (${colList}) VALUES (${placeholders})
-       ON CONFLICT (id) DO UPDATE SET ${setClauses}, synced_at = NOW()`,
-      vals,
-    );
+    // DEFERRED constraints handle any remaining out-of-order FK arrivals
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SET CONSTRAINTS ALL DEFERRED");
+      await client.query(
+        `INSERT INTO "${table}" (${colList}) VALUES (${placeholders})
+         ON CONFLICT (id) DO UPDATE SET ${setClauses}, synced_at = NOW()`,
+        vals,
+      );
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
 
     res.json({ ok: true });
   } catch (err) {
@@ -168,33 +276,38 @@ async function upsertRow(table, row, res) {
   }
 }
 
-// ── PUSH: POST /:table ────────────────────────────────────────────────────────
 app.post("/:table", async (req, res) => {
-  const { table } = req.params;
-  if (!guardTable(table, res)) return;
-  await upsertRow(table, req.body, res);
+  if (!guardTable(req.params.table, res)) return;
+  await upsertRow(req.params.table, req.body, res);
 });
-
-// ── PUSH: PUT /:table/:id ─────────────────────────────────────────────────────
 app.put("/:table/:id", async (req, res) => {
-  const { table, id } = req.params;
-  if (!guardTable(table, res)) return;
-  await upsertRow(table, { ...req.body, id: Number(id) }, res);
+  if (!guardTable(req.params.table, res)) return;
+  await upsertRow(
+    req.params.table,
+    { ...req.body, id: Number(req.params.id) },
+    res,
+  );
 });
 
-// ── PUSH: DELETE /:table/:id (soft-delete) ────────────────────────────────────
 app.delete("/:table/:id", async (req, res) => {
   const { table, id } = req.params;
   if (!guardTable(table, res)) return;
+  const client = await pool.connect();
   try {
-    await pool.query(
+    await client.query("BEGIN");
+    await client.query("SET CONSTRAINTS ALL DEFERRED");
+    await client.query(
       `UPDATE "${table}" SET _deleted = TRUE, updated_at = NOW(), synced_at = NOW() WHERE id = $1`,
       [id],
     );
+    await client.query("COMMIT");
     res.json({ ok: true });
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error(`DELETE /${table}/${id}:`, err.message);
     res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -202,20 +315,17 @@ app.delete("/:table/:id", async (req, res) => {
 //  LICENSE ENDPOINTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-// POST /license/activate
 app.post("/license/activate", async (req, res) => {
   const { key, machine_id, platform } = req.body;
   if (!key || !machine_id || !platform)
     return res
       .status(400)
       .json({ ok: false, error: "Missing key, machine_id or platform" });
-
   try {
     const { rows } = await pool.query("SELECT * FROM licenses WHERE key = $1", [
       key,
     ]);
     const lic = rows[0];
-
     if (!lic)
       return res.status(404).json({ ok: false, error: "Invalid license key" });
     if (!lic.is_active)
@@ -229,6 +339,7 @@ app.post("/license/activate", async (req, res) => {
       platform === "mobile" ? "activated_at_mobile" : "activated_at_desktop";
     const current = lic[col];
 
+    // Allow same device to re-activate (reinstall case)
     if (current && current !== machine_id)
       return res.status(403).json({
         ok: false,
@@ -239,27 +350,21 @@ app.post("/license/activate", async (req, res) => {
       `UPDATE licenses SET ${col} = $1, ${col_at} = NOW() WHERE key = $2`,
       [machine_id, key],
     );
-
     res.json({ ok: true, expires_at: lic.expires_at });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// POST /license/verify
 app.post("/license/verify", async (req, res) => {
   const { key, machine_id, platform } = req.body;
   if (!key || !machine_id || !platform)
-    return res
-      .status(400)
-      .json({ ok: false, error: "Missing key, machine_id or platform" });
-
+    return res.status(400).json({ ok: false, error: "Missing fields" });
   try {
     const { rows } = await pool.query("SELECT * FROM licenses WHERE key = $1", [
       key,
     ]);
     const lic = rows[0];
-
     if (!lic)
       return res.status(404).json({ ok: false, error: "Invalid license key" });
     if (!lic.is_active)
@@ -271,10 +376,19 @@ app.post("/license/verify", async (req, res) => {
       platform === "mobile" ? "machine_id_mobile" : "machine_id_desktop";
     const current = lic[col];
 
-    if (!current)
-      return res
-        .status(403)
-        .json({ ok: false, error: "Not activated on this platform yet" });
+    // If not yet activated on this platform, auto-activate on first verify
+    // This handles the case where the user enters the key offline and verifies
+    // online for the first time
+    if (!current) {
+      await pool.query(
+        `UPDATE licenses SET ${col} = $1, ${
+          platform === "mobile" ? "activated_at_mobile" : "activated_at_desktop"
+        } = NOW() WHERE key = $2`,
+        [machine_id, key],
+      );
+      return res.json({ ok: true, expires_at: lic.expires_at });
+    }
+
     if (current !== machine_id)
       return res
         .status(403)
@@ -286,12 +400,10 @@ app.post("/license/verify", async (req, res) => {
   }
 });
 
-// POST /license/deactivate
 app.post("/license/deactivate", async (req, res) => {
   const { key, machine_id, platform } = req.body;
   if (!key || !platform)
     return res.status(400).json({ ok: false, error: "Missing fields" });
-
   try {
     const { rows } = await pool.query("SELECT * FROM licenses WHERE key = $1", [
       key,
@@ -303,7 +415,6 @@ app.post("/license/deactivate", async (req, res) => {
       platform === "mobile" ? "machine_id_mobile" : "machine_id_desktop";
     const col_at =
       platform === "mobile" ? "activated_at_mobile" : "activated_at_desktop";
-
     if (lic[col] && lic[col] !== machine_id)
       return res.status(403).json({ ok: false, error: "Not your license" });
 
@@ -311,15 +422,13 @@ app.post("/license/deactivate", async (req, res) => {
       `UPDATE licenses SET ${col} = NULL, ${col_at} = NULL WHERE key = $1`,
       [key],
     );
-
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT ?? "3001");
-app.listen(PORT, () => {
-  console.log(`✅ Store sync backend running on port ${PORT}`);
-});
+app.listen(PORT, () =>
+  console.log(`✅ Store sync backend running on port ${PORT}`),
+);
