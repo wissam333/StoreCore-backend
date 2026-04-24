@@ -23,11 +23,6 @@ app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "10mb" }));
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
-// Only checks: key is known, active, and not expired.
-// machine_id is NOT checked here — that's the job of /license/verify.
-// Reason: after a reinstall the device activates → sync must work immediately.
-// If we checked machine_id here, the first sync after a fresh install on a
-// new device would fail until /verify was separately called.
 app.use(async (req, res, next) => {
   if (req.path === "/health" || req.path.startsWith("/license")) return next();
 
@@ -66,8 +61,6 @@ const ALLOWED_TABLES = new Set([
   "staff",
 ]);
 
-// Parent-before-child order for /changes pull — client applies in this order
-// so FK refs are always satisfied.
 const TABLE_PULL_ORDER = [
   "categories",
   "customers",
@@ -78,13 +71,12 @@ const TABLE_PULL_ORDER = [
   "dues",
 ];
 
-// Only real stored columns — strips computed JOIN columns like category_name,
-// customer_name, item_count, current_stock that the local IPC adds via SELECT.
 const TABLE_COLUMNS = {
   categories: new Set([
     "id",
     "name",
     "description",
+    "version",
     "created_at",
     "updated_at",
     "_deleted",
@@ -104,6 +96,7 @@ const TABLE_COLUMNS = {
     "unit",
     "image_url",
     "is_active",
+    "version",
     "created_at",
     "updated_at",
     "_deleted",
@@ -118,6 +111,7 @@ const TABLE_COLUMNS = {
     "total_orders",
     "total_spent",
     "last_order",
+    "version",
     "created_at",
     "updated_at",
     "_deleted",
@@ -133,6 +127,7 @@ const TABLE_COLUMNS = {
     "paid_amount",
     "display_currency",
     "notes",
+    "version",
     "created_at",
     "updated_at",
     "_deleted",
@@ -147,6 +142,7 @@ const TABLE_COLUMNS = {
     "sell_price_at_sale",
     "currency_at_sale",
     "line_total_sp",
+    "version",
     "created_at",
     "updated_at",
     "_deleted",
@@ -163,6 +159,7 @@ const TABLE_COLUMNS = {
     "due_date",
     "paid",
     "paid_at",
+    "version",
     "created_at",
     "updated_at",
     "_deleted",
@@ -177,11 +174,24 @@ const TABLE_COLUMNS = {
     "phone",
     "email",
     "is_active",
+    "version",
     "created_at",
     "updated_at",
     "_deleted",
     "synced_at",
   ]),
+};
+
+// SQLite sends booleans as 0/1 integers — Postgres needs real booleans
+const BOOL_COLS = new Set(["_deleted", "is_active", "paid"]);
+const normalizeRow = (row) => {
+  const out = { ...row };
+  for (const [k, v] of Object.entries(out)) {
+    if (BOOL_COLS.has(k) && typeof v === "number") {
+      out[k] = Boolean(v);
+    }
+  }
+  return out;
 };
 
 const stripRow = (table, row) => {
@@ -213,14 +223,13 @@ app.get("/changes", async (req, res) => {
     const offset = parseInt(req.query.offset ?? "0");
 
     const rows = [];
-    // Sequential in FK order — parents always come before children
     for (const table of TABLE_PULL_ORDER) {
       const result = await pool.query(
         `SELECT * FROM "${table}" WHERE updated_at > $1 ORDER BY updated_at ASC LIMIT $2 OFFSET $3`,
         [since, limit, offset],
       );
       for (const row of result.rows) {
-        if (table === "staff") delete row.password; // never send passwords
+        if (table === "staff") delete row.password;
         rows.push({ table, row });
       }
     }
@@ -238,7 +247,7 @@ async function upsertRow(table, rawRow, res) {
     if (!rawRow || rawRow.id === undefined || rawRow.id === null)
       return res.status(400).json({ ok: false, error: "Missing row.id" });
 
-    const row = stripRow(table, rawRow); // remove computed columns
+    const row = normalizeRow(stripRow(table, rawRow));
     const cols = Object.keys(row).filter((k) => k !== "synced_at");
     if (cols.length === 0)
       return res.status(400).json({ ok: false, error: "No valid columns" });
@@ -246,12 +255,24 @@ async function upsertRow(table, rawRow, res) {
     const vals = cols.map((k) => row[k]);
     const colList = cols.map((c) => `"${c}"`).join(", ");
     const placeholders = cols.map((_, i) => `$${i + 1}`).join(", ");
+
+    // Version-aware conflict resolution:
+    //  - version    → GREATEST(client, server)
+    //  - everything else → only overwrite if client version is strictly higher
     const setClauses = cols
       .filter((c) => c !== "id")
-      .map((c) => `"${c}" = EXCLUDED."${c}"`)
+      .map((c) => {
+        if (c === "version") {
+          return `"version" = GREATEST(EXCLUDED."version", "${table}"."version")`;
+        }
+        return `"${c}" = CASE
+          WHEN EXCLUDED.version > "${table}".version
+          THEN EXCLUDED."${c}"
+          ELSE "${table}"."${c}"
+        END`;
+      })
       .join(", ");
 
-    // DEFERRED constraints handle any remaining out-of-order FK arrivals
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -280,13 +301,11 @@ app.post("/:table", async (req, res) => {
   if (!guardTable(req.params.table, res)) return;
   await upsertRow(req.params.table, req.body, res);
 });
+
 app.put("/:table/:id", async (req, res) => {
   if (!guardTable(req.params.table, res)) return;
-  await upsertRow(
-    req.params.table,
-    { ...req.body, id: Number(req.params.id) },
-    res,
-  );
+  // ❌ FIXED: removed Number() cast — UUIDs are TEXT
+  await upsertRow(req.params.table, { ...req.body, id: req.params.id }, res);
 });
 
 app.delete("/:table/:id", async (req, res) => {
@@ -296,8 +315,11 @@ app.delete("/:table/:id", async (req, res) => {
   try {
     await client.query("BEGIN");
     await client.query("SET CONSTRAINTS ALL DEFERRED");
+    // Bump version so the delete doesn't lose to an older local row
     await client.query(
-      `UPDATE "${table}" SET _deleted = TRUE, updated_at = NOW(), synced_at = NOW() WHERE id = $1`,
+      `UPDATE "${table}"
+       SET _deleted = TRUE, version = version + 1, updated_at = NOW(), synced_at = NOW()
+       WHERE id = $1`,
       [id],
     );
     await client.query("COMMIT");
@@ -339,7 +361,6 @@ app.post("/license/activate", async (req, res) => {
       platform === "mobile" ? "activated_at_mobile" : "activated_at_desktop";
     const current = lic[col];
 
-    // Allow same device to re-activate (reinstall case)
     if (current && current !== machine_id)
       return res.status(403).json({
         ok: false,
@@ -376,9 +397,6 @@ app.post("/license/verify", async (req, res) => {
       platform === "mobile" ? "machine_id_mobile" : "machine_id_desktop";
     const current = lic[col];
 
-    // If not yet activated on this platform, auto-activate on first verify
-    // This handles the case where the user enters the key offline and verifies
-    // online for the first time
     if (!current) {
       await pool.query(
         `UPDATE licenses SET ${col} = $1, ${
