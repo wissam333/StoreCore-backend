@@ -237,64 +237,130 @@ app.get("/changes", async (req, res) => {
 });
 
 // ── Upsert ────────────────────────────────────────────────────────────────────
-async function upsertRow(table, rawRow, res) {
+async function upsertRow(table, rawRow, res, changedFields = null) {
   try {
     if (!rawRow || rawRow.id === undefined || rawRow.id === null)
       return res.status(400).json({ ok: false, error: "Missing row.id" });
 
     const row = normalizeRow(stripRow(table, rawRow));
-    const cols = Object.keys(row).filter((k) => k !== "synced_at");
-    if (cols.length === 0)
-      return res.status(400).json({ ok: false, error: "No valid columns" });
-
-    const vals = cols.map((k) => row[k]);
-    const colList = cols.map((c) => `"${c}"`).join(", ");
-    const placeholders = cols.map((_, i) => `$${i + 1}`).join(", ");
-
-    const setClauses = cols
-      .filter((c) => c !== "id")
-      .map((c) => {
-        if (c === "version")
-          return `"version" = GREATEST(EXCLUDED."version", "${table}"."version")`;
-        return `"${c}" = CASE
-          WHEN EXCLUDED.version > "${table}".version
-          THEN EXCLUDED."${c}"
-          ELSE "${table}"."${c}"
-        END`;
-      })
-      .join(", ");
+    const incomingVersion = row.version ?? 0;
 
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
       await client.query("SET CONSTRAINTS ALL DEFERRED");
-      await client.query(
-        `INSERT INTO "${table}" (${colList}) VALUES (${placeholders})
-         ON CONFLICT (id) DO UPDATE SET ${setClauses}, synced_at = NOW()`,
-        vals,
+
+      // Check what's currently stored
+      const existing = await client.query(
+        `SELECT * FROM "${table}" WHERE id = $1`,
+        [row.id],
       );
+      const current = existing.rows[0];
+
+      if (!current) {
+        // ── INSERT (row doesn't exist yet) ────────────────────────────────
+        const cols = Object.keys(row).filter((k) => k !== "synced_at");
+        const colList = cols.map((c) => `"${c}"`).join(", ");
+        const placeholders = cols.map((_, i) => `$${i + 1}`).join(", ");
+        const vals = cols.map((k) => row[k]);
+        await client.query(
+          `INSERT INTO "${table}" (${colList}, synced_at)
+           VALUES (${placeholders}, NOW())`,
+          vals,
+        );
+      } else {
+        // ── MERGE (row exists) ────────────────────────────────────────────
+        const currentVersion = current.version ?? 0;
+
+        // Build the merged row: start from current, apply incoming fields
+        // For PATCH (changedFields set): only apply the listed fields
+        // For PUT (changedFields null): apply all fields if incoming version wins
+        const merged = { ...current };
+
+        if (changedFields && changedFields.length > 0) {
+          // Field-level merge: each field independently decides winner
+          for (const field of changedFields) {
+            if (field in row && field !== "id" && field !== "synced_at") {
+              // Field wins if incoming version >= current version
+              // (equal version is ok — different field, no real conflict)
+              if (incomingVersion >= currentVersion) {
+                merged[field] = row[field];
+              }
+            }
+          }
+          // Always advance version to max of the two
+          merged.version = Math.max(currentVersion, incomingVersion);
+          // updated_at = most recent of the two
+          if (row.updated_at && row.updated_at > current.updated_at) {
+            merged.updated_at = row.updated_at;
+          }
+        } else {
+          // Legacy PUT: whole-row replace if incoming version wins
+          if (incomingVersion > currentVersion) {
+            Object.assign(merged, row);
+            merged.version = incomingVersion;
+          } else if (incomingVersion === currentVersion) {
+            // Tiebreak by timestamp
+            if (row.updated_at && row.updated_at > current.updated_at) {
+              Object.assign(merged, row);
+            }
+          }
+          // else: current wins, keep merged as-is
+        }
+
+        // Write the merged result back
+        const updateCols = Object.keys(merged).filter(
+          (k) => k !== "id" && k !== "synced_at" && k !== "created_at",
+        );
+        const setClause = updateCols
+          .map((c, i) => `"${c}" = $${i + 2}`)
+          .join(", ");
+        const vals = [row.id, ...updateCols.map((k) => merged[k])];
+        await client.query(
+          `UPDATE "${table}" SET ${setClause}, synced_at = NOW() WHERE id = $1`,
+          vals,
+        );
+      }
+
       await client.query("COMMIT");
+      res.json({ ok: true });
     } catch (err) {
       await client.query("ROLLBACK");
       throw err;
     } finally {
       client.release();
     }
-    res.json({ ok: true });
   } catch (err) {
     console.error(`upsertRow [${table}]:`, err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 }
 
+// ── Routes ────────────────────────────────────────────────────────────────────
 app.post("/:table", async (req, res) => {
   if (!guardTable(req.params.table, res)) return;
-  await upsertRow(req.params.table, req.body, res);
+  await upsertRow(req.params.table, req.body, res, null);
 });
 
 app.put("/:table/:id", async (req, res) => {
   if (!guardTable(req.params.table, res)) return;
-  await upsertRow(req.params.table, { ...req.body, id: req.params.id }, res);
+  await upsertRow(
+    req.params.table,
+    { ...req.body, id: req.params.id },
+    res,
+    null,
+  );
+});
+
+app.patch("/:table/:id", async (req, res) => {
+  if (!guardTable(req.params.table, res)) return;
+  const { _changed_fields, ...body } = req.body;
+  await upsertRow(
+    req.params.table,
+    { ...body, id: req.params.id },
+    res,
+    _changed_fields ?? null,
+  );
 });
 
 app.delete("/:table/:id", async (req, res) => {
