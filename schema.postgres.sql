@@ -150,9 +150,6 @@ CREATE TABLE IF NOT EXISTS licenses (
   expires_at            TIMESTAMPTZ,
   activated_at_desktop  TIMESTAMPTZ,
   activated_at_mobile   TIMESTAMPTZ,
-  -- Tracks the last successful /license/verify call per key.
-  -- Used for server-side auditing; grace-period logic lives on the client.
-  last_verified_at      TIMESTAMPTZ,
   created_at            TIMESTAMPTZ  DEFAULT NOW()
 );
 
