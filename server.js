@@ -1,21 +1,4 @@
 // sync-backend/server.js
-//
-// LICENSE ENDPOINT FIXES:
-//  1. /license/verify — REMOVED silent auto-activate side effect.
-//     Previously if machine_id_mobile/desktop was NULL, verify would silently
-//     write the caller's machine_id, permanently locking the license to the
-//     first device that ever called verify (not activate). This caused
-//     "License not valid for this device" on any subsequent device.
-//     FIX: verify now returns ok:true for an unbound machine_id but does NOT
-//     write it — only /activate may bind a machine_id.
-//
-//  2. /license/deactivate — machine_id check was too strict. If a device
-//     reinstalls the app (new UUID), it couldn't deactivate its own license.
-//     FIX: if the stored machine_id matches OR the stored machine_id is NULL,
-//     allow deactivation. The key ownership is already proven by knowing the key.
-//
-//  3. All endpoints — consistent JSON error shapes and HTTP status codes.
-
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -38,7 +21,7 @@ const pool = new Pool({
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "10mb" }));
 
-// ── Auth ──────────────────────────────────────────────────────────────────────
+// ── Auth middleware ───────────────────────────────────────────────────────────
 app.use(async (req, res, next) => {
   if (req.path === "/health" || req.path.startsWith("/license")) return next();
 
@@ -52,7 +35,6 @@ app.use(async (req, res, next) => {
       [token],
     );
     const lic = rows[0];
-
     if (!lic || !lic.is_active)
       return res.status(401).json({ ok: false, error: "Unauthorized" });
     if (lic.expires_at && new Date(lic.expires_at) < new Date())
@@ -199,12 +181,11 @@ const TABLE_COLUMNS = {
 };
 
 const BOOL_COLS = new Set(["_deleted", "is_active", "paid"]);
+
 const normalizeRow = (row) => {
   const out = { ...row };
   for (const [k, v] of Object.entries(out)) {
-    if (BOOL_COLS.has(k) && typeof v === "number") {
-      out[k] = Boolean(v);
-    }
+    if (BOOL_COLS.has(k) && typeof v === "number") out[k] = Boolean(v);
   }
   return out;
 };
@@ -225,12 +206,12 @@ const guardTable = (name, res) => {
   return true;
 };
 
-// ── Health ─────────────────────────────────────────────────────────────────────
+// ── Health ────────────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) =>
   res.json({ ok: true, ts: new Date().toISOString() }),
 );
 
-// ── PULL ───────────────────────────────────────────────────────────────────────
+// ── Pull ──────────────────────────────────────────────────────────────────────
 app.get("/changes", async (req, res) => {
   try {
     const since = req.query.since ?? "1970-01-01T00:00:00.000Z";
@@ -248,7 +229,6 @@ app.get("/changes", async (req, res) => {
         rows.push({ table, row });
       }
     }
-
     res.json({ ok: true, rows, hasMore: rows.length >= limit });
   } catch (err) {
     console.error("GET /changes:", err.message);
@@ -256,7 +236,7 @@ app.get("/changes", async (req, res) => {
   }
 });
 
-// ── UPSERT ─────────────────────────────────────────────────────────────────────
+// ── Upsert ────────────────────────────────────────────────────────────────────
 async function upsertRow(table, rawRow, res) {
   try {
     if (!rawRow || rawRow.id === undefined || rawRow.id === null)
@@ -274,9 +254,8 @@ async function upsertRow(table, rawRow, res) {
     const setClauses = cols
       .filter((c) => c !== "id")
       .map((c) => {
-        if (c === "version") {
+        if (c === "version")
           return `"version" = GREATEST(EXCLUDED."version", "${table}"."version")`;
-        }
         return `"${c}" = CASE
           WHEN EXCLUDED.version > "${table}".version
           THEN EXCLUDED."${c}"
@@ -301,7 +280,6 @@ async function upsertRow(table, rawRow, res) {
     } finally {
       client.release();
     }
-
     res.json({ ok: true });
   } catch (err) {
     console.error(`upsertRow [${table}]:`, err.message);
@@ -327,9 +305,8 @@ app.delete("/:table/:id", async (req, res) => {
     await client.query("BEGIN");
     await client.query("SET CONSTRAINTS ALL DEFERRED");
     await client.query(
-      `UPDATE "${table}"
-       SET _deleted = TRUE, version = version + 1, updated_at = NOW(), synced_at = NOW()
-       WHERE id = $1`,
+      `UPDATE "${table}" SET _deleted = TRUE, version = version + 1,
+       updated_at = NOW(), synced_at = NOW() WHERE id = $1`,
       [id],
     );
     await client.query("COMMIT");
@@ -373,20 +350,18 @@ app.post("/license/activate", async (req, res) => {
       platform === "mobile" ? "activated_at_mobile" : "activated_at_desktop";
     const current = lic[col];
 
-    // Already activated on this exact machine — idempotent, return ok
-    if (current && current === machine_id) {
+    // Already activated on this exact machine — idempotent
+    if (current && current === machine_id)
       return res.json({ ok: true, expires_at: lic.expires_at });
-    }
 
-    // Activated on a DIFFERENT machine — reject
-    if (current && current !== machine_id) {
+    // Activated on a different machine — reject
+    if (current && current !== machine_id)
       return res.status(403).json({
         ok: false,
         error: `License already activated on another ${platform} device. Deactivate it first.`,
       });
-    }
 
-    // Not yet activated for this platform — bind machine_id
+    // Not yet activated for this platform — bind now
     await pool.query(
       `UPDATE licenses SET ${col} = $1, ${col_at} = NOW() WHERE key = $2`,
       [machine_id, key],
@@ -399,15 +374,14 @@ app.post("/license/activate", async (req, res) => {
 });
 
 // ── Verify ────────────────────────────────────────────────────────────────────
-// BUG FIXED: old code silently wrote machine_id on first verify call,
-// permanently locking the license to that device without the user ever
-// explicitly activating. This caused "License not valid for this device"
-// on any subsequent device (or after reinstall with a new device UUID).
 //
-// NEW BEHAVIOUR:
-//  - machine_id is NULL  → license is unbound → verify ok but do NOT write
-//  - machine_id matches  → verify ok
-//  - machine_id mismatch → 403
+// FIX: previously returned ok:true when machine_id was NULL (unbound).
+// This meant any device that had a key in storage — even one that was never
+// explicitly activated — would pass verification and open the app.
+//
+// NEW RULE: machine_id MUST be bound AND must match the caller.
+// If unbound → 403, tell the client to activate first.
+// This forces the license screen to appear for any unactivated device.
 app.post("/license/verify", async (req, res) => {
   const { key, machine_id, platform } = req.body;
   if (!key || !machine_id || !platform)
@@ -429,27 +403,31 @@ app.post("/license/verify", async (req, res) => {
       platform === "mobile" ? "machine_id_mobile" : "machine_id_desktop";
     const current = lic[col];
 
-    // Not yet bound to any machine — allow (but do NOT write machine_id here)
-    // The client must call /activate to bind. This prevents the silent-lock bug.
+    // FIX: unbound = not activated yet = must go through /activate first
     if (!current) {
-      return res.json({ ok: true, expires_at: lic.expires_at, bound: false });
+      return res.status(403).json({
+        ok: false,
+        error:
+          "License not activated on this device. Please enter your license key.",
+        reason: "not_activated",
+      });
     }
 
-    // Bound to a different machine — reject
+    // Bound to a different machine
     if (current !== machine_id) {
       return res.status(403).json({
         ok: false,
         error:
           "License not valid for this device. Please activate on this device first.",
+        reason: "wrong_device",
       });
     }
 
-    // Matches — refresh timestamp
+    // Match — refresh timestamp
     await pool.query(
       `UPDATE licenses SET last_verified_at = NOW() WHERE key = $1`,
       [key],
     );
-
     res.json({ ok: true, expires_at: lic.expires_at, bound: true });
   } catch (err) {
     console.error("/license/verify:", err.message);
@@ -458,12 +436,8 @@ app.post("/license/verify", async (req, res) => {
 });
 
 // ── Deactivate ────────────────────────────────────────────────────────────────
-// BUG FIXED: old code rejected deactivation if machine_id didn't match.
-// This meant that after an app reinstall (new device UUID), users could
-// never deactivate their own license.
-//
-// NEW BEHAVIOUR: knowing the key is sufficient proof of ownership.
-// We still log the requesting machine_id but don't enforce it as a gate.
+// Knowing the key is sufficient proof of ownership.
+// We allow deactivation even if machine_id changed (e.g. after reinstall).
 app.post("/license/deactivate", async (req, res) => {
   const { key, machine_id, platform } = req.body;
   if (!key || !platform)
@@ -483,12 +457,10 @@ app.post("/license/deactivate", async (req, res) => {
     const col_at =
       platform === "mobile" ? "activated_at_mobile" : "activated_at_desktop";
 
-    // If the license is bound to a DIFFERENT machine, still allow deactivation —
-    // the user knows the key, which is sufficient. Log the discrepancy.
     if (lic[col] && machine_id && lic[col] !== machine_id) {
       console.warn(
         `[license] deactivate: key ${key} bound to ${lic[col]}, ` +
-          `deactivate requested by ${machine_id} — allowing (key ownership proven)`,
+          `requested by ${machine_id} — allowing (key ownership proven)`,
       );
     }
 
