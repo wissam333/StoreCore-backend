@@ -293,18 +293,13 @@ async function upsertRow(table, rawRow, res, changedFields = null) {
         const merged = { ...current };
 
         if (changedFields !== null && changedFields.length > 0) {
-          // Field-level PATCH merge: apply only the listed changed fields
           for (const field of changedFields) {
             if (field in row && field !== "id" && field !== "synced_at") {
-              if (incomingVersion >= currentVersion) {
-                merged[field] = row[field];
-              }
+              merged[field] = row[field]; // ← remove the version gate for field-level PATCH
             }
           }
-          merged.version = Math.max(currentVersion, incomingVersion);
-          if (row.updated_at && row.updated_at > current.updated_at) {
-            merged.updated_at = row.updated_at;
-          }
+          merged.version = Math.max(currentVersion, incomingVersion) + 1;
+          merged.updated_at = new Date().toISOString();
         } else if (changedFields === null) {
           // Legacy POST/PUT: whole-row replace if incoming version wins
           if (incomingVersion > currentVersion) {
