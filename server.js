@@ -229,7 +229,12 @@ app.get("/changes", async (req, res) => {
         rows.push({ table, row });
       }
     }
-    res.json({ ok: true, rows, hasMore: rows.length >= limit });
+    res.json({
+      ok: true,
+      rows,
+      hasMore: rows.length >= limit,
+      server_time: new Date().toISOString(),
+    });
   } catch (err) {
     console.error("GET /changes:", err.message);
     res.status(500).json({ ok: false, error: err.message });
