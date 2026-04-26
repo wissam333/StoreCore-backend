@@ -185,7 +185,17 @@ const BOOL_COLS = new Set(["_deleted", "is_active", "paid"]);
 const normalizeRow = (row) => {
   const out = { ...row };
   for (const [k, v] of Object.entries(out)) {
-    if (BOOL_COLS.has(k) && typeof v === "number") out[k] = Boolean(v);
+    if (BOOL_COLS.has(k)) {
+      // Coerce integers (from SQLite clients) AND booleans to proper boolean
+      // PostgreSQL boolean columns reject integer 1/0 — must be true/false
+      if (typeof v === "number" || typeof v === "boolean") {
+        out[k] = Boolean(v);
+      } else if (v === "1" || v === "true") {
+        out[k] = true;
+      } else if (v === "0" || v === "false") {
+        out[k] = false;
+      }
+    }
   }
   return out;
 };
@@ -217,22 +227,23 @@ app.get("/changes", async (req, res) => {
     const since = req.query.since ?? "1970-01-01T00:00:00.000Z";
     const limit = Math.min(parseInt(req.query.limit ?? "200"), 1000);
     const offset = parseInt(req.query.offset ?? "0");
-
-    const rows = [];
+    const allRows = [];
     for (const table of TABLE_PULL_ORDER) {
       const result = await pool.query(
-        `SELECT * FROM "${table}" WHERE updated_at > $1 ORDER BY updated_at ASC LIMIT $2 OFFSET $3`,
-        [since, limit, offset],
+        `SELECT * FROM "${table}" WHERE updated_at > $1 ORDER BY updated_at ASC`,
+        [since],
       );
       for (const row of result.rows) {
         if (table === "staff") delete row.password;
-        rows.push({ table, row });
+        allRows.push({ table, row });
       }
     }
+
+    const page = allRows.slice(offset, offset + limit);
     res.json({
       ok: true,
-      rows,
-      hasMore: rows.length >= limit,
+      rows: page,
+      hasMore: offset + limit < allRows.length,
       server_time: new Date().toISOString(),
     });
   } catch (err) {
@@ -240,7 +251,6 @@ app.get("/changes", async (req, res) => {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
-
 // ── Upsert ────────────────────────────────────────────────────────────────────
 async function upsertRow(table, rawRow, res, changedFields = null) {
   try {
@@ -282,35 +292,30 @@ async function upsertRow(table, rawRow, res, changedFields = null) {
         // For PUT (changedFields null): apply all fields if incoming version wins
         const merged = { ...current };
 
-        if (changedFields && changedFields.length > 0) {
-          // Field-level merge: each field independently decides winner
+        if (changedFields !== null && changedFields.length > 0) {
+          // Field-level PATCH merge: apply only the listed changed fields
           for (const field of changedFields) {
             if (field in row && field !== "id" && field !== "synced_at") {
-              // Field wins if incoming version >= current version
-              // (equal version is ok — different field, no real conflict)
               if (incomingVersion >= currentVersion) {
                 merged[field] = row[field];
               }
             }
           }
-          // Always advance version to max of the two
           merged.version = Math.max(currentVersion, incomingVersion);
-          // updated_at = most recent of the two
           if (row.updated_at && row.updated_at > current.updated_at) {
             merged.updated_at = row.updated_at;
           }
-        } else {
-          // Legacy PUT: whole-row replace if incoming version wins
+        } else if (changedFields === null) {
+          // Legacy POST/PUT: whole-row replace if incoming version wins
           if (incomingVersion > currentVersion) {
             Object.assign(merged, row);
             merged.version = incomingVersion;
           } else if (incomingVersion === currentVersion) {
-            // Tiebreak by timestamp
             if (row.updated_at && row.updated_at > current.updated_at) {
               Object.assign(merged, row);
             }
           }
-          // else: current wins, keep merged as-is
+          // else: current wins
         }
 
         // Write the merged result back
