@@ -156,6 +156,25 @@ CREATE TABLE IF NOT EXISTS licenses (
   created_at            TIMESTAMPTZ  DEFAULT NOW()
 );
 
+
+
+-- PostgreSQL (sync-backend)
+CREATE TABLE IF NOT EXISTS order_payments (
+  id          TEXT          PRIMARY KEY,
+  order_id    TEXT          NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  amount      NUMERIC(14,4) NOT NULL,
+  currency    TEXT          NOT NULL DEFAULT 'SP',
+  amount_sp   NUMERIC(14,4) NOT NULL DEFAULT 0,
+  note        TEXT,
+  paid_at     TIMESTAMPTZ   DEFAULT NOW(),
+  version     INTEGER       NOT NULL DEFAULT 1,
+  created_at  TIMESTAMPTZ   DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ   DEFAULT NOW(),
+  _deleted    BOOLEAN       DEFAULT FALSE,
+  synced_at   TIMESTAMPTZ
+);
+
+
 -- ─────────────────────────────────────────────────────────────────────────────
 --  Indexes — updated_at is the hot path for pull queries
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -166,3 +185,5 @@ CREATE INDEX IF NOT EXISTS idx_orders_updated_at      ON orders(updated_at);
 CREATE INDEX IF NOT EXISTS idx_order_items_updated_at ON order_items(updated_at);
 CREATE INDEX IF NOT EXISTS idx_dues_updated_at        ON dues(updated_at);
 CREATE INDEX IF NOT EXISTS idx_staff_updated_at       ON staff(updated_at);
+CREATE INDEX IF NOT EXISTS idx_order_payments_order_id   ON order_payments(order_id);
+CREATE INDEX IF NOT EXISTS idx_order_payments_updated_at ON order_payments(updated_at);

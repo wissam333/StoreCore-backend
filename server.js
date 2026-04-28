@@ -1,4 +1,6 @@
 // sync-backend/server.js
+// UPDATED: Added order_payments to ALLOWED_TABLES, TABLE_PULL_ORDER, and TABLE_COLUMNS
+
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -55,6 +57,7 @@ const ALLOWED_TABLES = new Set([
   "customers",
   "orders",
   "order_items",
+  "order_payments", // ← NEW
   "dues",
   "staff",
 ]);
@@ -66,6 +69,7 @@ const TABLE_PULL_ORDER = [
   "products",
   "orders",
   "order_items",
+  "order_payments", // ← NEW: must come after orders
   "dues",
 ];
 
@@ -146,6 +150,21 @@ const TABLE_COLUMNS = {
     "_deleted",
     "synced_at",
   ]),
+  // ── NEW ──
+  order_payments: new Set([
+    "id",
+    "order_id",
+    "amount",
+    "currency",
+    "amount_sp",
+    "note",
+    "paid_at",
+    "version",
+    "created_at",
+    "updated_at",
+    "_deleted",
+    "synced_at",
+  ]),
   dues: new Set([
     "id",
     "customer_id",
@@ -186,8 +205,6 @@ const normalizeRow = (row) => {
   const out = { ...row };
   for (const [k, v] of Object.entries(out)) {
     if (BOOL_COLS.has(k)) {
-      // Coerce integers (from SQLite clients) AND booleans to proper boolean
-      // PostgreSQL boolean columns reject integer 1/0 — must be true/false
       if (typeof v === "number" || typeof v === "boolean") {
         out[k] = Boolean(v);
       } else if (v === "1" || v === "true") {
@@ -251,6 +268,7 @@ app.get("/changes", async (req, res) => {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
+
 // ── Upsert ────────────────────────────────────────────────────────────────────
 async function upsertRow(table, rawRow, res, changedFields = null) {
   try {
@@ -265,7 +283,6 @@ async function upsertRow(table, rawRow, res, changedFields = null) {
       await client.query("BEGIN");
       await client.query("SET CONSTRAINTS ALL DEFERRED");
 
-      // Check what's currently stored
       const existing = await client.query(
         `SELECT * FROM "${table}" WHERE id = $1`,
         [row.id],
@@ -273,35 +290,27 @@ async function upsertRow(table, rawRow, res, changedFields = null) {
       const current = existing.rows[0];
 
       if (!current) {
-        // ── INSERT (row doesn't exist yet) ────────────────────────────────
         const cols = Object.keys(row).filter((k) => k !== "synced_at");
         const colList = cols.map((c) => `"${c}"`).join(", ");
         const placeholders = cols.map((_, i) => `$${i + 1}`).join(", ");
         const vals = cols.map((k) => row[k]);
         await client.query(
-          `INSERT INTO "${table}" (${colList}, synced_at)
-           VALUES (${placeholders}, NOW())`,
+          `INSERT INTO "${table}" (${colList}, synced_at) VALUES (${placeholders}, NOW())`,
           vals,
         );
       } else {
-        // ── MERGE (row exists) ────────────────────────────────────────────
         const currentVersion = current.version ?? 0;
-
-        // Build the merged row: start from current, apply incoming fields
-        // For PATCH (changedFields set): only apply the listed fields
-        // For PUT (changedFields null): apply all fields if incoming version wins
         const merged = { ...current };
 
         if (changedFields !== null && changedFields.length > 0) {
           for (const field of changedFields) {
             if (field in row && field !== "id" && field !== "synced_at") {
-              merged[field] = row[field]; // ← remove the version gate for field-level PATCH
+              merged[field] = row[field];
             }
           }
           merged.version = Math.max(currentVersion, incomingVersion) + 1;
           merged.updated_at = new Date().toISOString();
         } else if (changedFields === null) {
-          // Legacy POST/PUT: whole-row replace if incoming version wins
           if (incomingVersion > currentVersion) {
             Object.assign(merged, row);
             merged.version = incomingVersion;
@@ -310,10 +319,8 @@ async function upsertRow(table, rawRow, res, changedFields = null) {
               Object.assign(merged, row);
             }
           }
-          // else: current wins
         }
 
-        // Write the merged result back
         const updateCols = Object.keys(merged).filter(
           (k) => k !== "id" && k !== "synced_at" && k !== "created_at",
         );
@@ -391,11 +398,7 @@ app.delete("/:table/:id", async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  LICENSE ENDPOINTS
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ── Activate ──────────────────────────────────────────────────────────────────
+// ── LICENSE ENDPOINTS ─────────────────────────────────────────────────────────
 app.post("/license/activate", async (req, res) => {
   const { key, machine_id, platform } = req.body;
   if (!key || !machine_id || !platform)
@@ -421,18 +424,15 @@ app.post("/license/activate", async (req, res) => {
       platform === "mobile" ? "activated_at_mobile" : "activated_at_desktop";
     const current = lic[col];
 
-    // Already activated on this exact machine — idempotent
     if (current && current === machine_id)
       return res.json({ ok: true, expires_at: lic.expires_at });
 
-    // Activated on a different machine — reject
     if (current && current !== machine_id)
       return res.status(403).json({
         ok: false,
         error: `License already activated on another ${platform} device. Deactivate it first.`,
       });
 
-    // Not yet activated for this platform — bind now
     await pool.query(
       `UPDATE licenses SET ${col} = $1, ${col_at} = NOW() WHERE key = $2`,
       [machine_id, key],
@@ -444,15 +444,6 @@ app.post("/license/activate", async (req, res) => {
   }
 });
 
-// ── Verify ────────────────────────────────────────────────────────────────────
-//
-// FIX: previously returned ok:true when machine_id was NULL (unbound).
-// This meant any device that had a key in storage — even one that was never
-// explicitly activated — would pass verification and open the app.
-//
-// NEW RULE: machine_id MUST be bound AND must match the caller.
-// If unbound → 403, tell the client to activate first.
-// This forces the license screen to appear for any unactivated device.
 app.post("/license/verify", async (req, res) => {
   const { key, machine_id, platform } = req.body;
   if (!key || !machine_id || !platform)
@@ -474,7 +465,6 @@ app.post("/license/verify", async (req, res) => {
       platform === "mobile" ? "machine_id_mobile" : "machine_id_desktop";
     const current = lic[col];
 
-    // FIX: unbound = not activated yet = must go through /activate first
     if (!current) {
       return res.status(403).json({
         ok: false,
@@ -484,7 +474,6 @@ app.post("/license/verify", async (req, res) => {
       });
     }
 
-    // Bound to a different machine
     if (current !== machine_id) {
       return res.status(403).json({
         ok: false,
@@ -494,7 +483,6 @@ app.post("/license/verify", async (req, res) => {
       });
     }
 
-    // Match — refresh timestamp
     await pool.query(
       `UPDATE licenses SET last_verified_at = NOW() WHERE key = $1`,
       [key],
@@ -506,9 +494,6 @@ app.post("/license/verify", async (req, res) => {
   }
 });
 
-// ── Deactivate ────────────────────────────────────────────────────────────────
-// Knowing the key is sufficient proof of ownership.
-// We allow deactivation even if machine_id changed (e.g. after reinstall).
 app.post("/license/deactivate", async (req, res) => {
   const { key, machine_id, platform } = req.body;
   if (!key || !platform)
