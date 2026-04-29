@@ -20,7 +20,12 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-app.use(cors({ origin: "*" }));
+app.use(
+  cors({
+    origin: "*",
+    allowedHeaders: ["Content-Type", "Authorization", "x-admin-secret"],
+  }),
+);
 app.use(express.json({ limit: "10mb" }));
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
