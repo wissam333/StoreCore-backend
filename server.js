@@ -399,18 +399,22 @@ app.delete("/:table/:id", async (req, res) => {
 });
 
 // ── LICENSE ENDPOINTS ─────────────────────────────────────────────────────────
+// ── LICENSE ENDPOINTS ─────────────────────────────────────────────────────────
+
 app.post("/license/activate", async (req, res) => {
-  const { key, machine_id, platform } = req.body;
+  const { key, machine_id, platform, label } = req.body;
   if (!key || !machine_id || !platform)
     return res
       .status(400)
       .json({ ok: false, error: "Missing key, machine_id or platform" });
 
   try {
-    const { rows } = await pool.query("SELECT * FROM licenses WHERE key = $1", [
-      key,
-    ]);
-    const lic = rows[0];
+    // Load license
+    const { rows: licRows } = await pool.query(
+      `SELECT * FROM licenses WHERE key = $1`,
+      [key],
+    );
+    const lic = licRows[0];
     if (!lic)
       return res.status(404).json({ ok: false, error: "Invalid license key" });
     if (!lic.is_active)
@@ -418,26 +422,57 @@ app.post("/license/activate", async (req, res) => {
     if (lic.expires_at && new Date(lic.expires_at) < new Date())
       return res.status(403).json({ ok: false, error: "License expired" });
 
-    const col =
-      platform === "mobile" ? "machine_id_mobile" : "machine_id_desktop";
-    const col_at =
-      platform === "mobile" ? "activated_at_mobile" : "activated_at_desktop";
-    const current = lic[col];
+    // Check if this device is already registered (re-activation = just update last_seen)
+    const { rows: existing } = await pool.query(
+      `SELECT * FROM license_devices WHERE license_key = $1 AND machine_id = $2`,
+      [key, machine_id],
+    );
 
-    if (current && current === machine_id)
-      return res.json({ ok: true, expires_at: lic.expires_at });
+    if (existing.length > 0) {
+      // Already registered — update last_seen and platform in case it changed
+      await pool.query(
+        `UPDATE license_devices SET last_seen_at = NOW(), platform = $1 WHERE license_key = $2 AND machine_id = $3`,
+        [platform, key, machine_id],
+      );
+      return res.json({
+        ok: true,
+        expires_at: lic.expires_at,
+        already_registered: true,
+      });
+    }
 
-    if (current && current !== machine_id)
+    // New device — check slot count
+    const { rows: countRows } = await pool.query(
+      `SELECT COUNT(*) as n FROM license_devices WHERE license_key = $1`,
+      [key],
+    );
+    const usedSlots = parseInt(countRows[0].n);
+    const maxDevices = lic.max_devices ?? 2;
+
+    if (usedSlots >= maxDevices) {
       return res.status(403).json({
         ok: false,
-        error: `License already activated on another ${platform} device. Deactivate it first.`,
+        error: `All ${maxDevices} device slots are used. Contact support to add more slots or deactivate an existing device.`,
+        reason: "slots_full",
+        used: usedSlots,
+        max: maxDevices,
       });
+    }
 
+    // Register the new device
     await pool.query(
-      `UPDATE licenses SET ${col} = $1, ${col_at} = NOW() WHERE key = $2`,
-      [machine_id, key],
+      `INSERT INTO license_devices (license_key, machine_id, platform, label)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (license_key, machine_id) DO UPDATE SET last_seen_at = NOW()`,
+      [key, machine_id, platform, label ?? null],
     );
-    res.json({ ok: true, expires_at: lic.expires_at });
+
+    return res.json({
+      ok: true,
+      expires_at: lic.expires_at,
+      used: usedSlots + 1,
+      max: maxDevices,
+    });
   } catch (err) {
     console.error("/license/activate:", err.message);
     res.status(500).json({ ok: false, error: err.message });
@@ -450,10 +485,11 @@ app.post("/license/verify", async (req, res) => {
     return res.status(400).json({ ok: false, error: "Missing fields" });
 
   try {
-    const { rows } = await pool.query("SELECT * FROM licenses WHERE key = $1", [
-      key,
-    ]);
-    const lic = rows[0];
+    const { rows: licRows } = await pool.query(
+      `SELECT * FROM licenses WHERE key = $1`,
+      [key],
+    );
+    const lic = licRows[0];
     if (!lic)
       return res.status(404).json({ ok: false, error: "Invalid license key" });
     if (!lic.is_active)
@@ -461,33 +497,41 @@ app.post("/license/verify", async (req, res) => {
     if (lic.expires_at && new Date(lic.expires_at) < new Date())
       return res.status(403).json({ ok: false, error: "License expired" });
 
-    const col =
-      platform === "mobile" ? "machine_id_mobile" : "machine_id_desktop";
-    const current = lic[col];
+    // Check this device is registered
+    const { rows: deviceRows } = await pool.query(
+      `SELECT * FROM license_devices WHERE license_key = $1 AND machine_id = $2`,
+      [key, machine_id],
+    );
 
-    if (!current) {
+    if (deviceRows.length === 0) {
       return res.status(403).json({
         ok: false,
-        error:
-          "License not activated on this device. Please enter your license key.",
+        error: "This device is not activated. Please enter your license key.",
         reason: "not_activated",
       });
     }
 
-    if (current !== machine_id) {
-      return res.status(403).json({
-        ok: false,
-        error:
-          "License not valid for this device. Please activate on this device first.",
-        reason: "wrong_device",
-      });
-    }
-
+    // Update last_seen
+    await pool.query(
+      `UPDATE license_devices SET last_seen_at = NOW() WHERE license_key = $1 AND machine_id = $2`,
+      [key, machine_id],
+    );
     await pool.query(
       `UPDATE licenses SET last_verified_at = NOW() WHERE key = $1`,
       [key],
     );
-    res.json({ ok: true, expires_at: lic.expires_at, bound: true });
+
+    return res.json({
+      ok: true,
+      expires_at: lic.expires_at,
+      used: (
+        await pool.query(
+          `SELECT COUNT(*) as n FROM license_devices WHERE license_key = $1`,
+          [key],
+        )
+      ).rows[0].n,
+      max: lic.max_devices,
+    });
   } catch (err) {
     console.error("/license/verify:", err.message);
     res.status(500).json({ ok: false, error: err.message });
@@ -496,37 +540,162 @@ app.post("/license/verify", async (req, res) => {
 
 app.post("/license/deactivate", async (req, res) => {
   const { key, machine_id, platform } = req.body;
-  if (!key || !platform)
+  if (!key || !machine_id)
     return res
       .status(400)
-      .json({ ok: false, error: "Missing key or platform" });
+      .json({ ok: false, error: "Missing key or machine_id" });
 
   try {
-    const { rows } = await pool.query("SELECT * FROM licenses WHERE key = $1", [
-      key,
-    ]);
-    const lic = rows[0];
-    if (!lic) return res.status(404).json({ ok: false, error: "Invalid key" });
-
-    const col =
-      platform === "mobile" ? "machine_id_mobile" : "machine_id_desktop";
-    const col_at =
-      platform === "mobile" ? "activated_at_mobile" : "activated_at_desktop";
-
-    if (lic[col] && machine_id && lic[col] !== machine_id) {
-      console.warn(
-        `[license] deactivate: key ${key} bound to ${lic[col]}, ` +
-          `requested by ${machine_id} — allowing (key ownership proven)`,
-      );
-    }
-
-    await pool.query(
-      `UPDATE licenses SET ${col} = NULL, ${col_at} = NULL WHERE key = $1`,
+    const { rows: licRows } = await pool.query(
+      `SELECT key FROM licenses WHERE key = $1`,
       [key],
     );
-    res.json({ ok: true });
+    if (!licRows[0])
+      return res.status(404).json({ ok: false, error: "Invalid key" });
+
+    await pool.query(
+      `DELETE FROM license_devices WHERE license_key = $1 AND machine_id = $2`,
+      [key, machine_id],
+    );
+
+    return res.json({ ok: true });
   } catch (err) {
     console.error("/license/deactivate:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── ADMIN ROUTES ──────────────────────────────────────────────────────────────
+// Protect with a separate admin secret — never exposed to clients
+const ADMIN_SECRET = process.env.ADMIN_SECRET ?? "change-me-in-env";
+
+const adminAuth = (req, res, next) => {
+  const secret = req.headers["x-admin-secret"] ?? "";
+  if (secret !== ADMIN_SECRET)
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  next();
+};
+
+// List all licenses with device counts
+app.get("/admin/licenses", adminAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT l.*,
+        COUNT(d.id) as used_slots
+      FROM licenses l
+      LEFT JOIN license_devices d ON d.license_key = l.key
+      GROUP BY l.key
+      ORDER BY l.created_at DESC
+    `);
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Get one license with its devices
+app.get("/admin/licenses/:key", adminAuth, async (req, res) => {
+  try {
+    const { rows: licRows } = await pool.query(
+      `SELECT * FROM licenses WHERE key = $1`,
+      [req.params.key],
+    );
+    if (!licRows[0])
+      return res.status(404).json({ ok: false, error: "Not found" });
+
+    const { rows: devices } = await pool.query(
+      `SELECT * FROM license_devices WHERE license_key = $1 ORDER BY activated_at`,
+      [req.params.key],
+    );
+
+    res.json({ ok: true, data: { ...licRows[0], devices } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Create a new license key
+app.post("/admin/licenses", adminAuth, async (req, res) => {
+  try {
+    const { key, max_devices = 2, expires_at = null, notes = null } = req.body;
+
+    if (!key?.trim())
+      return res.status(400).json({ ok: false, error: "key is required" });
+
+    await pool.query(
+      `INSERT INTO licenses (key, max_devices, expires_at, is_active)
+       VALUES ($1, $2, $3, TRUE)`,
+      [key.trim(), max_devices, expires_at],
+    );
+
+    res.json({ ok: true, key: key.trim(), max_devices });
+  } catch (err) {
+    if (err.code === "23505")
+      return res.status(409).json({ ok: false, error: "Key already exists" });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Update max_devices or is_active on a license
+app.patch("/admin/licenses/:key", adminAuth, async (req, res) => {
+  try {
+    const { max_devices, is_active, expires_at } = req.body;
+    const updates = [];
+    const vals = [];
+    let i = 1;
+
+    if (max_devices !== undefined) {
+      updates.push(`max_devices = $${i++}`);
+      vals.push(max_devices);
+    }
+    if (is_active !== undefined) {
+      updates.push(`is_active = $${i++}`);
+      vals.push(is_active);
+    }
+    if (expires_at !== undefined) {
+      updates.push(`expires_at = $${i++}`);
+      vals.push(expires_at);
+    }
+    if (updates.length === 0)
+      return res.status(400).json({ ok: false, error: "Nothing to update" });
+
+    vals.push(req.params.key);
+    await pool.query(
+      `UPDATE licenses SET ${updates.join(", ")} WHERE key = $${i}`,
+      vals,
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Revoke a specific device slot (admin forcefully removes it)
+app.delete(
+  "/admin/licenses/:key/devices/:machine_id",
+  adminAuth,
+  async (req, res) => {
+    try {
+      await pool.query(
+        `DELETE FROM license_devices WHERE license_key = $1 AND machine_id = $2`,
+        [req.params.key, req.params.machine_id],
+      );
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  },
+);
+
+// Revoke ALL devices for a license (full reset)
+app.delete("/admin/licenses/:key/devices", adminAuth, async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM license_devices WHERE license_key = $1`, [
+      req.params.key,
+    ]);
+    res.json({ ok: true });
+  } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
