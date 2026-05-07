@@ -60,9 +60,10 @@ const ALLOWED_TABLES = new Set([
   "categories",
   "products",
   "customers",
+  "roles",
   "orders",
   "order_items",
-  "order_payments", // ← NEW
+  "order_payments",
   "dues",
   "staff",
 ]);
@@ -70,11 +71,12 @@ const ALLOWED_TABLES = new Set([
 const TABLE_PULL_ORDER = [
   "categories",
   "customers",
+  "roles",
   "staff",
   "products",
   "orders",
   "order_items",
-  "order_payments", // ← NEW: must come after orders
+  "order_payments",
   "dues",
 ];
 
@@ -202,9 +204,20 @@ const TABLE_COLUMNS = {
     "_deleted",
     "synced_at",
   ]),
+  roles: new Set([
+    "id",
+    "name",
+    "permissions",
+    "is_system",
+    "version",
+    "created_at",
+    "updated_at",
+    "_deleted",
+    "synced_at",
+  ]),
 };
 
-const BOOL_COLS = new Set(["_deleted", "is_active", "paid"]);
+const BOOL_COLS = new Set(["_deleted", "is_active", "paid", "is_system"]);
 
 const normalizeRow = (row) => {
   const out = { ...row };
