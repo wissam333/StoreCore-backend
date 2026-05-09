@@ -310,13 +310,24 @@ async function upsertRow(table, rawRow, res, changedFields = null) {
       );
       const current = existing.rows[0];
 
+      // In upsertRow, replace the INSERT block with this:
       if (!current) {
         const cols = Object.keys(row).filter((k) => k !== "synced_at");
         const colList = cols.map((c) => `"${c}"`).join(", ");
         const placeholders = cols.map((_, i) => `$${i + 1}`).join(", ");
         const vals = cols.map((k) => row[k]);
+
+        // Use ON CONFLICT (id) DO UPDATE to handle cases where
+        // a soft-deleted row with same id already exists
         await client.query(
-          `INSERT INTO "${table}" (${colList}, synced_at) VALUES (${placeholders}, NOW())`,
+          `INSERT INTO "${table}" (${colList}, synced_at) 
+     VALUES (${placeholders}, NOW())
+     ON CONFLICT (id) DO UPDATE SET
+       ${cols
+         .filter((c) => c !== "id" && c !== "created_at")
+         .map((c, i) => `"${c}" = $${i + 1}`)
+         .join(", ")},
+       synced_at = NOW()`,
           vals,
         );
       } else {
