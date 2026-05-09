@@ -318,7 +318,7 @@ app.get("/changes", async (req, res) => {
     const allRows = [];
     for (const table of TABLE_PULL_ORDER) {
       const result = await pool.query(
-        `SELECT * FROM "${table}" WHERE updated_at > $1 ORDER BY updated_at ASC`,
+        `SELECT * FROM "${table}" WHERE synced_at > $1 ORDER BY synced_at ASC`,
         [since],
       );
       for (const row of result.rows) {
