@@ -226,13 +226,10 @@ const normalizeRow = (row) => {
   const out = { ...row };
   for (const [k, v] of Object.entries(out)) {
     if (BOOL_COLS.has(k)) {
-      if (typeof v === "number" || typeof v === "boolean") {
-        out[k] = Boolean(v);
-      } else if (v === "1" || v === "true") {
-        out[k] = true;
-      } else if (v === "0" || v === "false") {
+      if (v === true || v === 1 || v === "1" || v === "true") out[k] = true;
+      else if (v === false || v === 0 || v === "0" || v === "false")
         out[k] = false;
-      }
+      else out[k] = Boolean(v);
     }
   }
   return out;
