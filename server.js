@@ -811,7 +811,9 @@ app.post("/admin/seed", adminAuth, async (req, res) => {
       "settings.view": true,
       "settings.edit": true,
       "staff.view": true,
-      "staff.manage": true,
+      "staff.add": true,
+      "staff.edit": true,
+      "staff.delete": true,
     };
     const CASHIER_PERMISSIONS = {
       "products.view": true,
@@ -834,7 +836,9 @@ app.post("/admin/seed", adminAuth, async (req, res) => {
       "settings.view": false,
       "settings.edit": false,
       "staff.view": false,
-      "staff.manage": false,
+      "staff.add": false,
+      "staff.edit": false,
+      "staff.delete": false,
     };
 
     // Wipe all staff first
