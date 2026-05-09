@@ -194,7 +194,10 @@ const TABLE_COLUMNS = {
     "full_name",
     "username",
     "password",
+    "pin",
     "role",
+    "role_id", // ← ADD
+    "last_login", // ← ADD
     "phone",
     "email",
     "is_active",
@@ -686,6 +689,118 @@ app.patch("/admin/licenses/:key", adminAuth, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── Seed endpoint — idempotent, safe to call multiple times ──────────────────
+app.post("/admin/seed", adminAuth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const ADMIN_ROLE_ID = "role-0001-0000-0000-000000000001";
+    const CASHIER_ROLE_ID = "role-0002-0000-0000-000000000002";
+    const ADMIN_STAFF_ID = "staff-0001-0000-0000-000000000001";
+
+    const ADMIN_PERMISSIONS = {
+      "products.view": true,
+      "products.add": true,
+      "products.edit": true,
+      "products.delete": true,
+      "orders.view": true,
+      "orders.add": true,
+      "orders.edit": true,
+      "orders.delete": true,
+      "customers.view": true,
+      "customers.add": true,
+      "customers.edit": true,
+      "customers.delete": true,
+      "dues.view": true,
+      "dues.add": true,
+      "dues.edit": true,
+      "dues.delete": true,
+      "reports.view": true,
+      "settings.view": true,
+      "settings.edit": true,
+      "staff.view": true,
+      "staff.manage": true,
+    };
+    const CASHIER_PERMISSIONS = {
+      "products.view": true,
+      "products.add": false,
+      "products.edit": false,
+      "products.delete": false,
+      "orders.view": true,
+      "orders.add": true,
+      "orders.edit": false,
+      "orders.delete": false,
+      "customers.view": true,
+      "customers.add": true,
+      "customers.edit": false,
+      "customers.delete": false,
+      "dues.view": true,
+      "dues.add": false,
+      "dues.edit": false,
+      "dues.delete": false,
+      "reports.view": false,
+      "settings.view": false,
+      "settings.edit": false,
+      "staff.view": false,
+      "staff.manage": false,
+    };
+
+    // Wipe all staff first
+    await client.query(`DELETE FROM staff`);
+
+    // Upsert Administrator role with fixed ID
+    await client.query(
+      `
+      INSERT INTO roles (id, name, permissions, is_system, version, created_at, updated_at, _deleted)
+      VALUES ($1, 'Administrator', $2, TRUE, 1, NOW(), NOW(), FALSE)
+      ON CONFLICT (id) DO UPDATE SET
+        name        = 'Administrator',
+        permissions = $2,
+        is_system   = TRUE,
+        updated_at  = NOW(),
+        _deleted    = FALSE,
+        synced_at   = NOW()
+    `,
+      [ADMIN_ROLE_ID, JSON.stringify(ADMIN_PERMISSIONS)],
+    );
+
+    // Upsert Cashier role with fixed ID
+    await client.query(
+      `
+      INSERT INTO roles (id, name, permissions, is_system, version, created_at, updated_at, _deleted)
+      VALUES ($1, 'Cashier', $2, FALSE, 1, NOW(), NOW(), FALSE)
+      ON CONFLICT (id) DO UPDATE SET
+        name        = 'Cashier',
+        permissions = $2,
+        is_system   = FALSE,
+        updated_at  = NOW(),
+        _deleted    = FALSE,
+        synced_at   = NOW()
+    `,
+      [CASHIER_ROLE_ID, JSON.stringify(CASHIER_PERMISSIONS)],
+    );
+
+    // Insert fresh admin staff
+    await client.query(
+      `
+      INSERT INTO staff (id, full_name, username, password, role_id, role, is_active, version, created_at, updated_at, _deleted, synced_at)
+      VALUES ($1, 'Admin', 'admin', 'admin', $2, 'Administrator', TRUE, 1, NOW(), NOW(), FALSE, NOW())
+    `,
+      [ADMIN_STAFF_ID, ADMIN_ROLE_ID],
+    );
+
+    await client.query("COMMIT");
+    res.json({ ok: true, message: "Seeded successfully" });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("/admin/seed:", err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    client.release();
   }
 });
 
