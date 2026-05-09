@@ -221,6 +221,20 @@ const TABLE_COLUMNS = {
 };
 
 const BOOL_COLS = new Set(["_deleted", "is_active", "paid", "is_system"]);
+const TIMESTAMP_COLS = new Set([
+  "created_at",
+  "updated_at",
+  "paid_at",
+  "last_login",
+  "order_date",
+  "last_order",
+]);
+
+const coerceBool = (v) => {
+  if (v === true || v === 1 || v === "1" || v === "true") return true;
+  if (v === false || v === 0 || v === "0" || v === "false") return false;
+  return null;
+};
 
 const normalizeRow = (row) => {
   const out = { ...row };
@@ -341,19 +355,44 @@ async function upsertRow(table, rawRow, res, changedFields = null) {
       }
 
       if (!current) {
-        const cols = Object.keys(castedRow).filter((k) => k !== "synced_at");
+        const cols = Object.keys(row).filter((k) => k !== "synced_at");
         const colList = cols.map((c) => `"${c}"`).join(", ");
-        const placeholders = cols.map((_, i) => `$${i + 1}`).join(", ");
-        const vals = cols.map((k) => castedRow[k]);
+        const placeholders = cols
+          .map((_, i) => {
+            const col = cols[i];
+            if (BOOL_COLS.has(col)) return `$${i + 1}::boolean`;
+            if (
+              [
+                "created_at",
+                "updated_at",
+                "paid_at",
+                "last_login",
+                "order_date",
+              ].includes(col)
+            )
+              return `$${i + 1}::timestamptz`;
+            return `$${i + 1}`;
+          })
+          .join(", ");
+        const vals = cols.map((k) =>
+          BOOL_COLS.has(k) ? coerceBool(row[k]) : row[k],
+        );
         await client.query(
           `INSERT INTO "${table}" (${colList}, synced_at)
-           VALUES (${placeholders}, NOW())
-           ON CONFLICT (id) DO UPDATE SET
-             ${cols
-               .filter((c) => c !== "id" && c !== "created_at")
-               .map((c, i) => `"${c}" = $${i + 1}`)
-               .join(", ")},
-             synced_at = NOW()`,
+     VALUES (${placeholders}, NOW())
+     ON CONFLICT (id) DO UPDATE SET
+       ${cols
+         .filter((c) => c !== "id" && c !== "created_at")
+         .map((c, i) => {
+           if (BOOL_COLS.has(c)) return `"${c}" = $${i + 1}::boolean`;
+           if (
+             ["updated_at", "paid_at", "last_login", "order_date"].includes(c)
+           )
+             return `"${c}" = $${i + 1}::timestamptz`;
+           return `"${c}" = $${i + 1}`;
+         })
+         .join(", ")},
+       synced_at = NOW()`,
           vals,
         );
       } else {
@@ -386,9 +425,18 @@ async function upsertRow(table, rawRow, res, changedFields = null) {
           (k) => k !== "id" && k !== "synced_at" && k !== "created_at",
         );
         const setClause = updateCols
-          .map((c, i) => `"${c}" = $${i + 2}`)
+          .map((c, i) => {
+            if (BOOL_COLS.has(c)) return `"${c}" = $${i + 2}::boolean`;
+            if (
+              ["updated_at", "paid_at", "last_login", "order_date"].includes(c)
+            )
+              return `"${c}" = $${i + 2}::timestamptz`;
+            return `"${c}" = $${i + 2}`;
+          })
           .join(", ");
-        const vals = [row.id, ...updateCols.map((k) => merged[k])];
+        const vals = cols.map((k) =>
+          BOOL_COLS.has(k) ? coerceBool(row[k]) : row[k],
+        );
         await client.query(
           `UPDATE "${table}" SET ${setClause}, synced_at = NOW() WHERE id = $1`,
           vals,
