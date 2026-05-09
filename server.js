@@ -316,9 +316,14 @@ app.get("/changes", async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit ?? "200"), 1000);
     const offset = parseInt(req.query.offset ?? "0");
     const allRows = [];
+
     for (const table of TABLE_PULL_ORDER) {
       const result = await pool.query(
-        `SELECT * FROM "${table}" WHERE synced_at > $1 ORDER BY synced_at ASC`,
+        // FIX: use GREATEST(synced_at, updated_at) so rows synced long ago
+        // but never re-touched are still visible to a fresh client
+        `SELECT * FROM "${table}"
+         WHERE GREATEST(synced_at, updated_at) > $1
+         ORDER BY GREATEST(synced_at, updated_at) ASC`,
         [since],
       );
       for (const row of result.rows) {
