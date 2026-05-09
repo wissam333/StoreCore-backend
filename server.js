@@ -307,24 +307,53 @@ async function upsertRow(table, rawRow, res, changedFields = null) {
       );
       const current = existing.rows[0];
 
-      // In upsertRow, replace the INSERT block with this:
+      // Force-cast values to the correct PG type before building SQL
+      const castValue = (col, val) => {
+        if (BOOL_COLS.has(col)) {
+          if (val === true || val === 1 || val === "1" || val === "true")
+            return true;
+          if (val === false || val === 0 || val === "0" || val === "false")
+            return false;
+          return Boolean(val);
+        }
+        // Timestamps — normalize SQLite format to ISO so PG accepts them
+        if (
+          (col === "created_at" ||
+            col === "updated_at" ||
+            col === "paid_at" ||
+            col === "last_login" ||
+            col === "order_date" ||
+            col === "due_date") &&
+          typeof val === "string" &&
+          val.length > 0 &&
+          !val.includes("+") &&
+          !val.endsWith("Z")
+        ) {
+          return val.replace(" ", "T") + "Z";
+        }
+        return val;
+      };
+
+      // Build a clean row with all values cast
+      const castedRow = {};
+      for (const [k, v] of Object.entries(row)) {
+        castedRow[k] = castValue(k, v);
+      }
+
       if (!current) {
-        const cols = Object.keys(row).filter((k) => k !== "synced_at");
+        const cols = Object.keys(castedRow).filter((k) => k !== "synced_at");
         const colList = cols.map((c) => `"${c}"`).join(", ");
         const placeholders = cols.map((_, i) => `$${i + 1}`).join(", ");
-        const vals = cols.map((k) => row[k]);
-
-        // Use ON CONFLICT (id) DO UPDATE to handle cases where
-        // a soft-deleted row with same id already exists
+        const vals = cols.map((k) => castedRow[k]);
         await client.query(
-          `INSERT INTO "${table}" (${colList}, synced_at) 
-     VALUES (${placeholders}, NOW())
-     ON CONFLICT (id) DO UPDATE SET
-       ${cols
-         .filter((c) => c !== "id" && c !== "created_at")
-         .map((c, i) => `"${c}" = $${i + 1}`)
-         .join(", ")},
-       synced_at = NOW()`,
+          `INSERT INTO "${table}" (${colList}, synced_at)
+           VALUES (${placeholders}, NOW())
+           ON CONFLICT (id) DO UPDATE SET
+             ${cols
+               .filter((c) => c !== "id" && c !== "created_at")
+               .map((c, i) => `"${c}" = $${i + 1}`)
+               .join(", ")},
+             synced_at = NOW()`,
           vals,
         );
       } else {
@@ -333,19 +362,22 @@ async function upsertRow(table, rawRow, res, changedFields = null) {
 
         if (changedFields !== null && changedFields.length > 0) {
           for (const field of changedFields) {
-            if (field in row && field !== "id" && field !== "synced_at") {
-              merged[field] = row[field];
+            if (field in castedRow && field !== "id" && field !== "synced_at") {
+              merged[field] = castedRow[field];
             }
           }
           merged.version = Math.max(currentVersion, incomingVersion) + 1;
           merged.updated_at = new Date().toISOString();
-        } else if (changedFields === null) {
+        } else {
           if (incomingVersion > currentVersion) {
-            Object.assign(merged, row);
+            Object.assign(merged, castedRow);
             merged.version = incomingVersion;
           } else if (incomingVersion === currentVersion) {
-            if (row.updated_at && row.updated_at > current.updated_at) {
-              Object.assign(merged, row);
+            if (
+              castedRow.updated_at &&
+              castedRow.updated_at > current.updated_at
+            ) {
+              Object.assign(merged, castedRow);
             }
           }
         }
