@@ -221,6 +221,7 @@ const TABLE_COLUMNS = {
 };
 
 const BOOL_COLS = new Set(["_deleted", "is_active", "paid", "is_system"]);
+
 const TIMESTAMP_COLS = new Set([
   "created_at",
   "updated_at",
@@ -228,7 +229,45 @@ const TIMESTAMP_COLS = new Set([
   "last_login",
   "order_date",
   "last_order",
+  "synced_at",
+  "queued_at",
 ]);
+
+// Coerce a single value to the correct JS type for pg to handle
+const coerce = (col, val) => {
+  // NULL passthrough
+  if (val === null || val === undefined) return null;
+
+  // Boolean columns — SQLite sends 0/1 or "0"/"1"
+  if (BOOL_COLS.has(col)) {
+    if (val === true || val === 1 || val === "1" || val === "true") return true;
+    if (val === false || val === 0 || val === "0" || val === "false")
+      return false;
+    return null;
+  }
+
+  // Timestamp columns — SQLite sends "2026-05-09 09:34:46" (no timezone)
+  // Convert to JS Date so pg sends it as a proper timestamptz
+  if (TIMESTAMP_COLS.has(col) && typeof val === "string" && val.trim() !== "") {
+    // Replace space separator with T, append Z if no offset present
+    const iso = val.includes("T") ? val : val.replace(" ", "T");
+    const withTz =
+      iso.endsWith("Z") || /[+-]\d{2}:\d{2}$/.test(iso) ? iso : iso + "Z";
+    const d = new Date(withTz);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  return val;
+};
+
+// Coerce all fields in a row object
+const coerceRow = (row) => {
+  const out = {};
+  for (const [k, v] of Object.entries(row)) {
+    out[k] = coerce(k, v);
+  }
+  return out;
+};
 
 const coerceBool = (v) => {
   if (v === true || v === 1 || v === "1" || v === "true") return true;
@@ -307,7 +346,9 @@ async function upsertRow(table, rawRow, res, changedFields = null) {
     if (!rawRow || rawRow.id === undefined || rawRow.id === null)
       return res.status(400).json({ ok: false, error: "Missing row.id" });
 
-    const row = normalizeRow(stripRow(table, rawRow));
+    // 1. Strip columns not in whitelist, then coerce types
+    const stripped = stripRow(table, rawRow);
+    const row = coerceRow(stripped);
     const incomingVersion = row.version ?? 0;
 
     const client = await pool.connect();
@@ -315,130 +356,89 @@ async function upsertRow(table, rawRow, res, changedFields = null) {
       await client.query("BEGIN");
       await client.query("SET CONSTRAINTS ALL DEFERRED");
 
+      // 2. Check if row already exists
       const existing = await client.query(
         `SELECT * FROM "${table}" WHERE id = $1`,
         [row.id],
       );
       const current = existing.rows[0];
 
-      // Force-cast values to the correct PG type before building SQL
-      const castValue = (col, val) => {
-        if (BOOL_COLS.has(col)) {
-          if (val === true || val === 1 || val === "1" || val === "true")
-            return true;
-          if (val === false || val === 0 || val === "0" || val === "false")
-            return false;
-          return Boolean(val);
-        }
-        // Timestamps — normalize SQLite format to ISO so PG accepts them
-        if (
-          (col === "created_at" ||
-            col === "updated_at" ||
-            col === "paid_at" ||
-            col === "last_login" ||
-            col === "order_date" ||
-            col === "due_date") &&
-          typeof val === "string" &&
-          val.length > 0 &&
-          !val.includes("+") &&
-          !val.endsWith("Z")
-        ) {
-          return val.replace(" ", "T") + "Z";
-        }
-        return val;
-      };
-
-      // Build a clean row with all values cast
-      const castedRow = {};
-      for (const [k, v] of Object.entries(row)) {
-        castedRow[k] = castValue(k, v);
-      }
-
       if (!current) {
+        // ── INSERT ─────────────────────────────────────────────────────────
         const cols = Object.keys(row).filter((k) => k !== "synced_at");
         const colList = cols.map((c) => `"${c}"`).join(", ");
-        const placeholders = cols
-          .map((_, i) => {
-            const col = cols[i];
-            if (BOOL_COLS.has(col)) return `$${i + 1}::boolean`;
-            if (
-              [
-                "created_at",
-                "updated_at",
-                "paid_at",
-                "last_login",
-                "order_date",
-              ].includes(col)
-            )
-              return `$${i + 1}::timestamptz`;
-            return `$${i + 1}`;
-          })
-          .join(", ");
-        const vals = cols.map((k) =>
-          BOOL_COLS.has(k) ? coerceBool(row[k]) : row[k],
-        );
+        const placeholders = cols.map((_, i) => `$${i + 1}`).join(", ");
+        const vals = cols.map((k) => row[k]);
+
         await client.query(
           `INSERT INTO "${table}" (${colList}, synced_at)
-     VALUES (${placeholders}, NOW())
-     ON CONFLICT (id) DO UPDATE SET
-       ${cols
-         .filter((c) => c !== "id" && c !== "created_at")
-         .map((c, i) => {
-           if (BOOL_COLS.has(c)) return `"${c}" = $${i + 1}::boolean`;
-           if (
-             ["updated_at", "paid_at", "last_login", "order_date"].includes(c)
-           )
-             return `"${c}" = $${i + 1}::timestamptz`;
-           return `"${c}" = $${i + 1}`;
-         })
-         .join(", ")},
-       synced_at = NOW()`,
+           VALUES (${placeholders}, NOW())
+           ON CONFLICT (id) DO UPDATE
+             SET ${cols
+               .filter((c) => c !== "id" && c !== "created_at")
+               .map((c) => {
+                 const idx = cols.indexOf(c) + 1;
+                 return `"${c}" = $${idx}`;
+               })
+               .join(", ")},
+             synced_at = NOW()`,
           vals,
         );
       } else {
+        // ── UPDATE (merge) ─────────────────────────────────────────────────
         const currentVersion = current.version ?? 0;
+
+        // Start from current DB row, then apply changes
         const merged = { ...current };
 
         if (changedFields !== null && changedFields.length > 0) {
+          // Field-level merge: only overwrite fields the sender changed
           for (const field of changedFields) {
-            if (field in castedRow && field !== "id" && field !== "synced_at") {
-              merged[field] = castedRow[field];
+            if (field in row && field !== "id" && field !== "synced_at") {
+              merged[field] = row[field];
             }
           }
           merged.version = Math.max(currentVersion, incomingVersion) + 1;
-          merged.updated_at = new Date().toISOString();
+          merged.updated_at = new Date();
         } else {
+          // Version-based full merge
           if (incomingVersion > currentVersion) {
-            Object.assign(merged, castedRow);
+            Object.assign(merged, row);
             merged.version = incomingVersion;
           } else if (incomingVersion === currentVersion) {
-            if (
-              castedRow.updated_at &&
-              castedRow.updated_at > current.updated_at
-            ) {
-              Object.assign(merged, castedRow);
+            // Tie-break on updated_at
+            const remoteUpdated = row.updated_at
+              ? new Date(row.updated_at)
+              : null;
+            const localUpdated = current.updated_at
+              ? new Date(current.updated_at)
+              : null;
+            if (remoteUpdated && localUpdated && remoteUpdated > localUpdated) {
+              Object.assign(merged, row);
             }
+            // else local wins — no change
           }
+          // incomingVersion < currentVersion → local wins, no change
         }
 
-        const updateCols = Object.keys(merged).filter(
+        // Coerce merged row (current DB values may need no coercion,
+        // but applied remote values do)
+        const coercedMerged = coerceRow(merged);
+
+        const updateCols = Object.keys(coercedMerged).filter(
           (k) => k !== "id" && k !== "synced_at" && k !== "created_at",
         );
+
         const setClause = updateCols
-          .map((c, i) => {
-            if (BOOL_COLS.has(c)) return `"${c}" = $${i + 2}::boolean`;
-            if (
-              ["updated_at", "paid_at", "last_login", "order_date"].includes(c)
-            )
-              return `"${c}" = $${i + 2}::timestamptz`;
-            return `"${c}" = $${i + 2}`;
-          })
+          .map((c, i) => `"${c}" = $${i + 2}`)
           .join(", ");
-        const vals = cols.map((k) =>
-          BOOL_COLS.has(k) ? coerceBool(row[k]) : row[k],
-        );
+
+        const vals = [row.id, ...updateCols.map((k) => coercedMerged[k])];
+
         await client.query(
-          `UPDATE "${table}" SET ${setClause}, synced_at = NOW() WHERE id = $1`,
+          `UPDATE "${table}"
+           SET ${setClause}, synced_at = NOW()
+           WHERE id = $1`,
           vals,
         );
       }
@@ -452,7 +452,7 @@ async function upsertRow(table, rawRow, res, changedFields = null) {
       client.release();
     }
   } catch (err) {
-    console.error(`upsertRow [${table}]:`, err.message);
+    console.error(`upsertRow [${table}]:`, err.message, JSON.stringify(rawRow));
     res.status(500).json({ ok: false, error: err.message });
   }
 }
