@@ -328,7 +328,6 @@ app.get("/changes", async (req, res) => {
         [since],
       );
       for (const row of result.rows) {
-        if (table === "staff") delete row.password;
         allRows.push({ table, row });
       }
     }
