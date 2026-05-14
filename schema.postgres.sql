@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS orders (
   paid_amount      NUMERIC(14,4) DEFAULT 0,
   display_currency TEXT          DEFAULT 'SP' CHECK(display_currency IN ('SP','USD')),
   notes            TEXT,
+  created_by       TEXT          REFERENCES staff(id) ON DELETE SET NULL,
   version          INTEGER       NOT NULL DEFAULT 1,
   created_at       TIMESTAMPTZ   DEFAULT NOW(),
   updated_at       TIMESTAMPTZ   DEFAULT NOW(),
@@ -238,3 +239,12 @@ EXCEPTION WHEN duplicate_column THEN NULL; END $$;
 DO $$ BEGIN
   ALTER TABLE staff DROP CONSTRAINT IF EXISTS staff_role_check;
 EXCEPTION WHEN OTHERS THEN NULL; END $$;
+
+DO $$ BEGIN
+  ALTER TABLE orders ADD COLUMN created_by TEXT REFERENCES staff(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_column THEN NULL; END $$;
+
+-- Backfill existing orders
+UPDATE orders SET created_by = 'staff-0001-0000-0000-000000000001' WHERE created_by IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_orders_created_by ON orders(created_by);

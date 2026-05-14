@@ -136,6 +136,7 @@ const TABLE_COLUMNS = {
     "paid_amount",
     "display_currency",
     "notes",
+    "created_by",
     "version",
     "created_at",
     "updated_at",
@@ -196,8 +197,8 @@ const TABLE_COLUMNS = {
     "password",
     "pin",
     "role",
-    "role_id", // ← ADD
-    "last_login", // ← ADD
+    "role_id",
+    "last_login",
     "phone",
     "email",
     "is_active",
