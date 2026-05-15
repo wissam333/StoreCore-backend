@@ -27,6 +27,7 @@ app.use(
 app.use(express.json({ limit: "10mb" }));
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
+// /health, /license/*, /admin/* all skip Bearer auth
 app.use(async (req, res, next) => {
   if (
     req.path === "/health" ||
@@ -49,7 +50,6 @@ app.use(async (req, res, next) => {
       return res.status(401).json({ ok: false, error: "Unauthorized" });
     if (lic.expires_at && new Date(lic.expires_at) < new Date())
       return res.status(401).json({ ok: false, error: "License expired" });
-
     req.licenseKey = token;
     next();
   } catch (err) {
@@ -57,6 +57,11 @@ app.use(async (req, res, next) => {
     return res.status(500).json({ ok: false, error: "Auth check failed" });
   }
 });
+
+// ── Health ────────────────────────────────────────────────────────────────────
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, ts: new Date().toISOString() }),
+);
 
 // ── LICENSE ENDPOINTS ─────────────────────────────────────────────────────────
 
@@ -68,7 +73,6 @@ app.post("/license/activate", async (req, res) => {
       .json({ ok: false, error: "Missing key, machine_id or platform" });
 
   try {
-    // Load license
     const { rows: licRows } = await pool.query(
       `SELECT * FROM licenses WHERE key = $1`,
       [key],
@@ -81,16 +85,15 @@ app.post("/license/activate", async (req, res) => {
     if (lic.expires_at && new Date(lic.expires_at) < new Date())
       return res.status(403).json({ ok: false, error: "License expired" });
 
-    // Check if this device is already registered (re-activation = just update last_seen)
     const { rows: existing } = await pool.query(
       `SELECT * FROM license_devices WHERE license_key = $1 AND machine_id = $2`,
       [key, machine_id],
     );
 
     if (existing.length > 0) {
-      // Already registered — update last_seen and platform in case it changed
       await pool.query(
-        `UPDATE license_devices SET last_seen_at = NOW(), platform = $1 WHERE license_key = $2 AND machine_id = $3`,
+        `UPDATE license_devices SET last_seen_at = NOW(), platform = $1
+         WHERE license_key = $2 AND machine_id = $3`,
         [platform, key, machine_id],
       );
       return res.json({
@@ -104,7 +107,6 @@ app.post("/license/activate", async (req, res) => {
       });
     }
 
-    // New device — check slot count
     const { rows: countRows } = await pool.query(
       `SELECT COUNT(*) as n FROM license_devices WHERE license_key = $1`,
       [key],
@@ -122,7 +124,6 @@ app.post("/license/activate", async (req, res) => {
       });
     }
 
-    // Register the new device
     await pool.query(
       `INSERT INTO license_devices (license_key, machine_id, platform, label)
        VALUES ($1, $2, $3, $4)
@@ -164,7 +165,6 @@ app.post("/license/verify", async (req, res) => {
     if (lic.expires_at && new Date(lic.expires_at) < new Date())
       return res.status(403).json({ ok: false, error: "License expired" });
 
-    // Check this device is registered
     const { rows: deviceRows } = await pool.query(
       `SELECT * FROM license_devices WHERE license_key = $1 AND machine_id = $2`,
       [key, machine_id],
@@ -178,9 +178,9 @@ app.post("/license/verify", async (req, res) => {
       });
     }
 
-    // Update last_seen
     await pool.query(
-      `UPDATE license_devices SET last_seen_at = NOW() WHERE license_key = $1 AND machine_id = $2`,
+      `UPDATE license_devices SET last_seen_at = NOW()
+       WHERE license_key = $1 AND machine_id = $2`,
       [key, machine_id],
     );
     await pool.query(
@@ -203,7 +203,7 @@ app.post("/license/verify", async (req, res) => {
 });
 
 app.post("/license/deactivate", async (req, res) => {
-  const { key, machine_id, platform } = req.body;
+  const { key, machine_id } = req.body;
   if (!key || !machine_id)
     return res
       .status(400)
@@ -221,7 +221,6 @@ app.post("/license/deactivate", async (req, res) => {
       `DELETE FROM license_devices WHERE license_key = $1 AND machine_id = $2`,
       [key, machine_id],
     );
-
     return res.json({ ok: true });
   } catch (err) {
     console.error("/license/deactivate:", err.message);
@@ -240,11 +239,10 @@ const adminAuth = (req, res, next) => {
 };
 
 // List all licenses with device counts
-app.get("/admin/licenses", adminAuth, async (req, res) => {
+app.get("/admin/licenses", adminAuth, async (_req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT l.*,
-        COUNT(d.id) as used_slots
+      SELECT l.*, COUNT(d.id) as used_slots
       FROM licenses l
       LEFT JOIN license_devices d ON d.license_key = l.key
       GROUP BY l.key
@@ -270,7 +268,6 @@ app.get("/admin/licenses/:key", adminAuth, async (req, res) => {
       `SELECT * FROM license_devices WHERE license_key = $1 ORDER BY activated_at`,
       [req.params.key],
     );
-
     res.json({ ok: true, data: { ...licRows[0], devices } });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -288,18 +285,18 @@ app.post("/admin/licenses", adminAuth, async (req, res) => {
       supabase_url = null,
       supabase_key = null,
     } = req.body;
+
+    if (!key?.trim())
+      return res.status(400).json({ ok: false, error: "key is required" });
     if (sync_enabled && (!supabase_url || !supabase_key))
       return res.status(400).json({
         ok: false,
         error: "supabase_url and supabase_key required when sync_enabled=true",
       });
 
-    if (!key?.trim())
-      return res.status(400).json({ ok: false, error: "key is required" });
-
     await pool.query(
       `INSERT INTO licenses (key, max_devices, expires_at, is_active, sync_enabled, supabase_url, supabase_key)
-   VALUES ($1, $2, $3, TRUE, $4, $5, $6)`,
+       VALUES ($1, $2, $3, TRUE, $4, $5, $6)`,
       [
         key.trim(),
         max_devices,
@@ -309,7 +306,6 @@ app.post("/admin/licenses", adminAuth, async (req, res) => {
         supabase_key,
       ],
     );
-
     res.json({ ok: true, key: key.trim(), max_devices });
   } catch (err) {
     if (err.code === "23505")
@@ -318,27 +314,34 @@ app.post("/admin/licenses", adminAuth, async (req, res) => {
   }
 });
 
-// Update max_devices or is_active on a license
+// Update a license
 app.patch("/admin/licenses/:key", adminAuth, async (req, res) => {
   try {
-    const { max_devices, is_active, expires_at } = req.body;
+    // FIX: all 6 fields now properly destructured
+    const {
+      max_devices,
+      is_active,
+      expires_at,
+      sync_enabled,
+      supabase_url,
+      supabase_key,
+    } = req.body;
     const updates = [];
     const vals = [];
     let i = 1;
 
     if (max_devices !== undefined) {
-      updates.push(`max_devices = $${i++}`);
+      updates.push(`max_devices  = $${i++}`);
       vals.push(max_devices);
     }
     if (is_active !== undefined) {
-      updates.push(`is_active = $${i++}`);
+      updates.push(`is_active    = $${i++}`);
       vals.push(is_active);
     }
     if (expires_at !== undefined) {
-      updates.push(`expires_at = $${i++}`);
+      updates.push(`expires_at   = $${i++}`);
       vals.push(expires_at);
     }
-
     if (sync_enabled !== undefined) {
       updates.push(`sync_enabled = $${i++}`);
       vals.push(sync_enabled);
@@ -351,6 +354,7 @@ app.patch("/admin/licenses/:key", adminAuth, async (req, res) => {
       updates.push(`supabase_key = $${i++}`);
       vals.push(supabase_key);
     }
+
     if (updates.length === 0)
       return res.status(400).json({ ok: false, error: "Nothing to update" });
 
@@ -359,18 +363,64 @@ app.patch("/admin/licenses/:key", adminAuth, async (req, res) => {
       `UPDATE licenses SET ${updates.join(", ")} WHERE key = $${i}`,
       vals,
     );
-
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// ── Seed endpoint — idempotent, safe to call multiple times ──────────────────
-app.post("/admin/seed", adminAuth, async (req, res) => {
-  const client = await pool.connect();
+// Revoke a specific device slot
+app.delete(
+  "/admin/licenses/:key/devices/:machine_id",
+  adminAuth,
+  async (req, res) => {
+    try {
+      await pool.query(
+        `DELETE FROM license_devices WHERE license_key = $1 AND machine_id = $2`,
+        [req.params.key, req.params.machine_id],
+      );
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  },
+);
+
+// Revoke ALL devices for a license
+app.delete("/admin/licenses/:key/devices", adminAuth, async (req, res) => {
   try {
-    await client.query("BEGIN");
+    await pool.query(`DELETE FROM license_devices WHERE license_key = $1`, [
+      req.params.key,
+    ]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── Seed a customer's Supabase project ────────────────────────────────────────
+// Call once per new sync customer after creating their Supabase project.
+app.post("/admin/seed-supabase/:key", adminAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT supabase_url, supabase_key, sync_enabled FROM licenses WHERE key = $1`,
+      [req.params.key],
+    );
+    const lic = rows[0];
+    if (!lic)
+      return res.status(404).json({ ok: false, error: "License not found" });
+    if (!lic.sync_enabled || !lic.supabase_url || !lic.supabase_key)
+      return res
+        .status(400)
+        .json({ ok: false, error: "License has no Supabase config" });
+
+    const base = `${lic.supabase_url}/rest/v1`;
+    const headers = {
+      "Content-Type": "application/json",
+      apikey: lic.supabase_key,
+      Authorization: `Bearer ${lic.supabase_key}`,
+      Prefer: "resolution=merge-duplicates,return=minimal",
+    };
 
     const ADMIN_ROLE_ID = "role-0001-0000-0000-000000000001";
     const CASHIER_ROLE_ID = "role-0002-0000-0000-000000000002";
@@ -401,6 +451,7 @@ app.post("/admin/seed", adminAuth, async (req, res) => {
       "staff.edit": true,
       "staff.delete": true,
     };
+
     const CASHIER_PERMISSIONS = {
       "products.view": true,
       "products.add": false,
@@ -427,91 +478,65 @@ app.post("/admin/seed", adminAuth, async (req, res) => {
       "staff.delete": false,
     };
 
-    // Wipe all staff first
-    await client.query(`DELETE FROM staff`);
-
-    // Upsert Administrator role with fixed ID
-    await client.query(
-      `
-      INSERT INTO roles (id, name, permissions, is_system, version, created_at, updated_at, _deleted)
-      VALUES ($1, 'Administrator', $2, TRUE, 1, NOW(), NOW(), FALSE)
-      ON CONFLICT (id) DO UPDATE SET
-        name        = 'Administrator',
-        permissions = $2,
-        is_system   = TRUE,
-        updated_at  = NOW(),
-        _deleted    = FALSE,
-        synced_at   = NOW()
-    `,
-      [ADMIN_ROLE_ID, JSON.stringify(ADMIN_PERMISSIONS)],
-    );
-
-    // Upsert Cashier role with fixed ID
-    await client.query(
-      `
-      INSERT INTO roles (id, name, permissions, is_system, version, created_at, updated_at, _deleted)
-      VALUES ($1, 'Cashier', $2, FALSE, 1, NOW(), NOW(), FALSE)
-      ON CONFLICT (id) DO UPDATE SET
-        name        = 'Cashier',
-        permissions = $2,
-        is_system   = FALSE,
-        updated_at  = NOW(),
-        _deleted    = FALSE,
-        synced_at   = NOW()
-    `,
-      [CASHIER_ROLE_ID, JSON.stringify(CASHIER_PERMISSIONS)],
-    );
-
-    // Insert fresh admin staff
-    await client.query(
-      `
-      INSERT INTO staff (id, full_name, username, password, role_id, role, is_active, version, created_at, updated_at, _deleted, synced_at)
-      VALUES ($1, 'Admin', 'admin', 'admin', $2, 'Administrator', TRUE, 1, NOW(), NOW(), FALSE, NOW())
-    `,
-      [ADMIN_STAFF_ID, ADMIN_ROLE_ID],
-    );
-
-    await client.query("COMMIT");
-    res.json({ ok: true, message: "Seeded successfully" });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("/admin/seed:", err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  } finally {
-    client.release();
-  }
-});
-
-// Revoke a specific device slot (admin forcefully removes it)
-app.delete(
-  "/admin/licenses/:key/devices/:machine_id",
-  adminAuth,
-  async (req, res) => {
-    try {
-      await pool.query(
-        `DELETE FROM license_devices WHERE license_key = $1 AND machine_id = $2`,
-        [req.params.key, req.params.machine_id],
-      );
-      res.json({ ok: true });
-    } catch (err) {
-      res.status(500).json({ ok: false, error: err.message });
+    // Seed roles
+    const rolesRes = await fetch(`${base}/roles`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify([
+        {
+          id: ADMIN_ROLE_ID,
+          name: "Administrator",
+          is_system: true,
+          version: 1,
+          permissions: ADMIN_PERMISSIONS,
+          _deleted: false,
+        },
+        {
+          id: CASHIER_ROLE_ID,
+          name: "Cashier",
+          is_system: false,
+          version: 1,
+          permissions: CASHIER_PERMISSIONS,
+          _deleted: false,
+        },
+      ]),
+    });
+    if (!rolesRes.ok) {
+      const err = await rolesRes.json().catch(() => ({}));
+      throw new Error(`Roles seed failed: ${JSON.stringify(err)}`);
     }
-  },
-);
 
-// Revoke ALL devices for a license (full reset)
-app.delete("/admin/licenses/:key/devices", adminAuth, async (req, res) => {
-  try {
-    await pool.query(`DELETE FROM license_devices WHERE license_key = $1`, [
-      req.params.key,
-    ]);
-    res.json({ ok: true });
+    // Seed admin staff
+    const staffRes = await fetch(`${base}/staff`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify([
+        {
+          id: ADMIN_STAFF_ID,
+          full_name: "Admin",
+          username: "admin",
+          password: "admin",
+          role_id: ADMIN_ROLE_ID,
+          role: "Administrator",
+          is_active: true,
+          version: 1,
+          _deleted: false,
+        },
+      ]),
+    });
+    if (!staffRes.ok) {
+      const err = await staffRes.json().catch(() => ({}));
+      throw new Error(`Staff seed failed: ${JSON.stringify(err)}`);
+    }
+
+    res.json({ ok: true, message: "Supabase seeded successfully" });
   } catch (err) {
+    console.error("/admin/seed-supabase:", err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
 const PORT = parseInt(process.env.PORT ?? "3001");
 app.listen(PORT, () =>
-  console.log(`✅ Store sync backend running on port ${PORT}`),
+  console.log(`✅ License server running on port ${PORT}`),
 );
