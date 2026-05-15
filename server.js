@@ -1,6 +1,4 @@
 // sync-backend/server.js
-// UPDATED: Added order_payments to ALLOWED_TABLES, TABLE_PULL_ORDER, and TABLE_COLUMNS
-
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -55,464 +53,6 @@ app.use(async (req, res, next) => {
   }
 });
 
-// ── Tables & column whitelist ─────────────────────────────────────────────────
-const ALLOWED_TABLES = new Set([
-  "categories",
-  "products",
-  "customers",
-  "roles",
-  "orders",
-  "order_items",
-  "order_payments",
-  "dues",
-  "staff",
-]);
-
-const TABLE_PULL_ORDER = [
-  "categories",
-  "customers",
-  "roles",
-  "staff",
-  "products",
-  "orders",
-  "order_items",
-  "order_payments",
-  "dues",
-];
-
-const TABLE_COLUMNS = {
-  categories: new Set([
-    "id",
-    "name",
-    "description",
-    "version",
-    "created_at",
-    "updated_at",
-    "_deleted",
-    "synced_at",
-  ]),
-  products: new Set([
-    "id",
-    "name",
-    "description",
-    "category_id",
-    "barcode",
-    "buy_price",
-    "sell_price",
-    "currency",
-    "stock",
-    "min_stock",
-    "unit",
-    "image_url",
-    "is_active",
-    "version",
-    "created_at",
-    "updated_at",
-    "_deleted",
-    "synced_at",
-  ]),
-  customers: new Set([
-    "id",
-    "name",
-    "phone",
-    "address",
-    "notes",
-    "total_orders",
-    "total_spent",
-    "last_order",
-    "version",
-    "created_at",
-    "updated_at",
-    "_deleted",
-    "synced_at",
-  ]),
-  orders: new Set([
-    "id",
-    "customer_id",
-    "order_date",
-    "status",
-    "total_sp",
-    "total_usd",
-    "paid_amount",
-    "display_currency",
-    "notes",
-    "created_by",
-    "version",
-    "created_at",
-    "updated_at",
-    "_deleted",
-    "synced_at",
-  ]),
-  order_items: new Set([
-    "id",
-    "order_id",
-    "product_id",
-    "product_name",
-    "quantity",
-    "sell_price_at_sale",
-    "currency_at_sale",
-    "line_total_sp",
-    "version",
-    "created_at",
-    "updated_at",
-    "_deleted",
-    "synced_at",
-  ]),
-  // ── NEW ──
-  order_payments: new Set([
-    "id",
-    "order_id",
-    "amount",
-    "currency",
-    "amount_sp",
-    "note",
-    "paid_at",
-    "version",
-    "created_at",
-    "updated_at",
-    "_deleted",
-    "synced_at",
-  ]),
-  dues: new Set([
-    "id",
-    "customer_id",
-    "order_id",
-    "amount",
-    "currency",
-    "amount_sp",
-    "description",
-    "due_date",
-    "paid",
-    "paid_at",
-    "version",
-    "created_at",
-    "updated_at",
-    "_deleted",
-    "synced_at",
-  ]),
-  staff: new Set([
-    "id",
-    "full_name",
-    "username",
-    "password",
-    "pin",
-    "role",
-    "role_id",
-    "last_login",
-    "phone",
-    "email",
-    "is_active",
-    "version",
-    "created_at",
-    "updated_at",
-    "_deleted",
-    "synced_at",
-  ]),
-  roles: new Set([
-    "id",
-    "name",
-    "permissions",
-    "is_system",
-    "version",
-    "created_at",
-    "updated_at",
-    "_deleted",
-    "synced_at",
-  ]),
-};
-
-const BOOL_COLS = new Set(["_deleted", "is_active", "paid", "is_system"]);
-
-const TIMESTAMP_COLS = new Set([
-  "created_at",
-  "updated_at",
-  "paid_at",
-  "last_login",
-  "order_date",
-  "last_order",
-  "synced_at",
-  "queued_at",
-]);
-
-// Coerce a single value to the correct JS type for pg to handle
-const coerce = (col, val) => {
-  // NULL passthrough
-  if (val === null || val === undefined) return null;
-
-  // Boolean columns — SQLite sends 0/1 or "0"/"1"
-  if (BOOL_COLS.has(col)) {
-    if (val === true || val === 1 || val === "1" || val === "true") return true;
-    if (val === false || val === 0 || val === "0" || val === "false")
-      return false;
-    return null;
-  }
-
-  // Timestamp columns — SQLite sends "2026-05-09 09:34:46" (no timezone)
-  // Convert to JS Date so pg sends it as a proper timestamptz
-  if (TIMESTAMP_COLS.has(col) && typeof val === "string" && val.trim() !== "") {
-    // Replace space separator with T, append Z if no offset present
-    const iso = val.includes("T") ? val : val.replace(" ", "T");
-    const withTz =
-      iso.endsWith("Z") || /[+-]\d{2}:\d{2}$/.test(iso) ? iso : iso + "Z";
-    const d = new Date(withTz);
-    return isNaN(d.getTime()) ? null : d;
-  }
-
-  return val;
-};
-
-// Coerce all fields in a row object
-const coerceRow = (row) => {
-  const out = {};
-  for (const [k, v] of Object.entries(row)) {
-    out[k] = coerce(k, v);
-  }
-  return out;
-};
-
-const coerceBool = (v) => {
-  if (v === true || v === 1 || v === "1" || v === "true") return true;
-  if (v === false || v === 0 || v === "0" || v === "false") return false;
-  return null;
-};
-
-const normalizeRow = (row) => {
-  const out = { ...row };
-  for (const [k, v] of Object.entries(out)) {
-    if (BOOL_COLS.has(k)) {
-      if (v === true || v === 1 || v === "1" || v === "true") out[k] = true;
-      else if (v === false || v === 0 || v === "0" || v === "false")
-        out[k] = false;
-      else out[k] = Boolean(v);
-    }
-  }
-  return out;
-};
-
-const stripRow = (table, row) => {
-  const allowed = TABLE_COLUMNS[table];
-  if (!allowed) return row;
-  return Object.fromEntries(
-    Object.entries(row).filter(([k]) => allowed.has(k)),
-  );
-};
-
-const guardTable = (name, res) => {
-  if (!ALLOWED_TABLES.has(name)) {
-    res.status(400).json({ ok: false, error: `Unknown table: ${name}` });
-    return false;
-  }
-  return true;
-};
-
-// ── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) =>
-  res.json({ ok: true, ts: new Date().toISOString() }),
-);
-
-// ── Pull ──────────────────────────────────────────────────────────────────────
-app.get("/changes", async (req, res) => {
-  try {
-    const since = req.query.since ?? "1970-01-01T00:00:00.000Z";
-    const limit = Math.min(parseInt(req.query.limit ?? "200"), 1000);
-    const offset = parseInt(req.query.offset ?? "0");
-    const allRows = [];
-
-    for (const table of TABLE_PULL_ORDER) {
-      const result = await pool.query(
-        // FIX: use GREATEST(synced_at, updated_at) so rows synced long ago
-        // but never re-touched are still visible to a fresh client
-        `SELECT * FROM "${table}"
-         WHERE GREATEST(synced_at, updated_at) > $1
-         ORDER BY GREATEST(synced_at, updated_at) ASC`,
-        [since],
-      );
-      for (const row of result.rows) {
-        allRows.push({ table, row });
-      }
-    }
-
-    const page = allRows.slice(offset, offset + limit);
-    res.json({
-      ok: true,
-      rows: page,
-      hasMore: offset + limit < allRows.length,
-      server_time: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.error("GET /changes:", err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// ── Upsert ────────────────────────────────────────────────────────────────────
-async function upsertRow(table, rawRow, res, changedFields = null) {
-  try {
-    if (!rawRow || rawRow.id === undefined || rawRow.id === null)
-      return res.status(400).json({ ok: false, error: "Missing row.id" });
-
-    // 1. Strip columns not in whitelist, then coerce types
-    const stripped = stripRow(table, rawRow);
-    const row = coerceRow(stripped);
-    const incomingVersion = row.version ?? 0;
-
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      await client.query("SET CONSTRAINTS ALL DEFERRED");
-
-      // 2. Check if row already exists
-      const existing = await client.query(
-        `SELECT * FROM "${table}" WHERE id = $1`,
-        [row.id],
-      );
-      const current = existing.rows[0];
-
-      if (!current) {
-        // ── INSERT ─────────────────────────────────────────────────────────
-        const cols = Object.keys(row).filter((k) => k !== "synced_at");
-        const colList = cols.map((c) => `"${c}"`).join(", ");
-        const placeholders = cols.map((_, i) => `$${i + 1}`).join(", ");
-        const vals = cols.map((k) => row[k]);
-
-        await client.query(
-          `INSERT INTO "${table}" (${colList}, synced_at)
-           VALUES (${placeholders}, NOW())
-           ON CONFLICT (id) DO UPDATE
-             SET ${cols
-               .filter((c) => c !== "id" && c !== "created_at")
-               .map((c) => {
-                 const idx = cols.indexOf(c) + 1;
-                 return `"${c}" = $${idx}`;
-               })
-               .join(", ")},
-             synced_at = NOW()`,
-          vals,
-        );
-      } else {
-        // ── UPDATE (merge) ─────────────────────────────────────────────────
-        const currentVersion = current.version ?? 0;
-
-        // Start from current DB row, then apply changes
-        const merged = { ...current };
-
-        if (changedFields !== null && changedFields.length > 0) {
-          // Field-level merge: only overwrite fields the sender changed
-          for (const field of changedFields) {
-            if (field in row && field !== "id" && field !== "synced_at") {
-              merged[field] = row[field];
-            }
-          }
-          merged.version = Math.max(currentVersion, incomingVersion) + 1;
-          merged.updated_at = new Date();
-        } else {
-          // Version-based full merge
-          if (incomingVersion > currentVersion) {
-            Object.assign(merged, row);
-            merged.version = incomingVersion;
-          } else if (incomingVersion === currentVersion) {
-            // Tie-break on updated_at
-            const remoteUpdated = row.updated_at
-              ? new Date(row.updated_at)
-              : null;
-            const localUpdated = current.updated_at
-              ? new Date(current.updated_at)
-              : null;
-            if (remoteUpdated && localUpdated && remoteUpdated > localUpdated) {
-              Object.assign(merged, row);
-            }
-            // else local wins — no change
-          }
-          // incomingVersion < currentVersion → local wins, no change
-        }
-
-        // Coerce merged row (current DB values may need no coercion,
-        // but applied remote values do)
-        const coercedMerged = coerceRow(merged);
-
-        const updateCols = Object.keys(coercedMerged).filter(
-          (k) => k !== "id" && k !== "synced_at" && k !== "created_at",
-        );
-
-        const setClause = updateCols
-          .map((c, i) => `"${c}" = $${i + 2}`)
-          .join(", ");
-
-        const vals = [row.id, ...updateCols.map((k) => coercedMerged[k])];
-
-        await client.query(
-          `UPDATE "${table}"
-           SET ${setClause}, synced_at = NOW()
-           WHERE id = $1`,
-          vals,
-        );
-      }
-
-      await client.query("COMMIT");
-      res.json({ ok: true });
-    } catch (err) {
-      await client.query("ROLLBACK");
-      throw err;
-    } finally {
-      client.release();
-    }
-  } catch (err) {
-    console.error(`upsertRow [${table}]:`, err.message, JSON.stringify(rawRow));
-    res.status(500).json({ ok: false, error: err.message });
-  }
-}
-
-// ── Routes ────────────────────────────────────────────────────────────────────
-app.post("/:table", async (req, res) => {
-  if (!guardTable(req.params.table, res)) return;
-  await upsertRow(req.params.table, req.body, res, null);
-});
-
-app.put("/:table/:id", async (req, res) => {
-  if (!guardTable(req.params.table, res)) return;
-  await upsertRow(
-    req.params.table,
-    { ...req.body, id: req.params.id },
-    res,
-    null,
-  );
-});
-
-app.patch("/:table/:id", async (req, res) => {
-  if (!guardTable(req.params.table, res)) return;
-  const { _changed_fields, ...body } = req.body;
-  await upsertRow(
-    req.params.table,
-    { ...body, id: req.params.id },
-    res,
-    _changed_fields ?? null,
-  );
-});
-
-app.delete("/:table/:id", async (req, res) => {
-  const { table, id } = req.params;
-  if (!guardTable(table, res)) return;
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    await client.query("SET CONSTRAINTS ALL DEFERRED");
-    await client.query(
-      `UPDATE "${table}" SET _deleted = TRUE, version = version + 1,
-       updated_at = NOW(), synced_at = NOW() WHERE id = $1`,
-      [id],
-    );
-    await client.query("COMMIT");
-    res.json({ ok: true });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error(`DELETE /${table}/${id}:`, err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  } finally {
-    client.release();
-  }
-});
-
-// ── LICENSE ENDPOINTS ─────────────────────────────────────────────────────────
 // ── LICENSE ENDPOINTS ─────────────────────────────────────────────────────────
 
 app.post("/license/activate", async (req, res) => {
@@ -551,6 +91,10 @@ app.post("/license/activate", async (req, res) => {
       return res.json({
         ok: true,
         expires_at: lic.expires_at,
+        sync_enabled: lic.sync_enabled ?? false,
+        ...(lic.sync_enabled && lic.supabase_url
+          ? { supabase_url: lic.supabase_url, supabase_key: lic.supabase_key }
+          : {}),
         already_registered: true,
       });
     }
@@ -584,6 +128,10 @@ app.post("/license/activate", async (req, res) => {
     return res.json({
       ok: true,
       expires_at: lic.expires_at,
+      sync_enabled: lic.sync_enabled ?? false,
+      ...(lic.sync_enabled && lic.supabase_url
+        ? { supabase_url: lic.supabase_url, supabase_key: lic.supabase_key }
+        : {}),
       used: usedSlots + 1,
       max: maxDevices,
     });
@@ -638,13 +186,10 @@ app.post("/license/verify", async (req, res) => {
     return res.json({
       ok: true,
       expires_at: lic.expires_at,
-      used: (
-        await pool.query(
-          `SELECT COUNT(*) as n FROM license_devices WHERE license_key = $1`,
-          [key],
-        )
-      ).rows[0].n,
-      max: lic.max_devices,
+      sync_enabled: lic.sync_enabled ?? false,
+      ...(lic.sync_enabled && lic.supabase_url
+        ? { supabase_url: lic.supabase_url, supabase_key: lic.supabase_key }
+        : {}),
     });
   } catch (err) {
     console.error("/license/verify:", err.message);
@@ -680,7 +225,6 @@ app.post("/license/deactivate", async (req, res) => {
 });
 
 // ── ADMIN ROUTES ──────────────────────────────────────────────────────────────
-// Protect with a separate admin secret — never exposed to clients
 const ADMIN_SECRET = process.env.ADMIN_SECRET ?? "change-me-in-env";
 
 const adminAuth = (req, res, next) => {
@@ -731,15 +275,34 @@ app.get("/admin/licenses/:key", adminAuth, async (req, res) => {
 // Create a new license key
 app.post("/admin/licenses", adminAuth, async (req, res) => {
   try {
-    const { key, max_devices = 2, expires_at = null, notes = null } = req.body;
+    const {
+      key,
+      max_devices = 2,
+      expires_at = null,
+      sync_enabled = false,
+      supabase_url = null,
+      supabase_key = null,
+    } = req.body;
+    if (sync_enabled && (!supabase_url || !supabase_key))
+      return res.status(400).json({
+        ok: false,
+        error: "supabase_url and supabase_key required when sync_enabled=true",
+      });
 
     if (!key?.trim())
       return res.status(400).json({ ok: false, error: "key is required" });
 
     await pool.query(
-      `INSERT INTO licenses (key, max_devices, expires_at, is_active)
-       VALUES ($1, $2, $3, TRUE)`,
-      [key.trim(), max_devices, expires_at],
+      `INSERT INTO licenses (key, max_devices, expires_at, is_active, sync_enabled, supabase_url, supabase_key)
+   VALUES ($1, $2, $3, TRUE, $4, $5, $6)`,
+      [
+        key.trim(),
+        max_devices,
+        expires_at,
+        sync_enabled,
+        supabase_url,
+        supabase_key,
+      ],
     );
 
     res.json({ ok: true, key: key.trim(), max_devices });
@@ -769,6 +332,19 @@ app.patch("/admin/licenses/:key", adminAuth, async (req, res) => {
     if (expires_at !== undefined) {
       updates.push(`expires_at = $${i++}`);
       vals.push(expires_at);
+    }
+
+    if (sync_enabled !== undefined) {
+      updates.push(`sync_enabled = $${i++}`);
+      vals.push(sync_enabled);
+    }
+    if (supabase_url !== undefined) {
+      updates.push(`supabase_url = $${i++}`);
+      vals.push(supabase_url);
+    }
+    if (supabase_key !== undefined) {
+      updates.push(`supabase_key = $${i++}`);
+      vals.push(supabase_key);
     }
     if (updates.length === 0)
       return res.status(400).json({ ok: false, error: "Nothing to update" });
