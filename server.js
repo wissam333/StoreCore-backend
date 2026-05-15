@@ -28,7 +28,12 @@ app.use(express.json({ limit: "10mb" }));
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
 app.use(async (req, res, next) => {
-  if (req.path === "/health" || req.path.startsWith("/license")) return next();
+  if (
+    req.path === "/health" ||
+    req.path.startsWith("/license") ||
+    req.path.startsWith("/admin")
+  )
+    return next();
 
   const auth = req.headers["authorization"] ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
