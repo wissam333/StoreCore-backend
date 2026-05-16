@@ -40,3 +40,36 @@ CREATE TABLE IF NOT EXISTS license_devices (
   UNIQUE(license_key, machine_id)
 );
 CREATE INDEX IF NOT EXISTS idx_license_devices_key ON license_devices(license_key);
+
+-- Device info columns (model, OS, version, IP, location)
+DO $$ BEGIN
+  ALTER TABLE license_devices ADD COLUMN device_model  TEXT;
+EXCEPTION WHEN duplicate_column THEN NULL; END $$;
+
+DO $$ BEGIN
+  ALTER TABLE license_devices ADD COLUMN os_version    TEXT;
+EXCEPTION WHEN duplicate_column THEN NULL; END $$;
+
+DO $$ BEGIN
+  ALTER TABLE license_devices ADD COLUMN app_version   TEXT;
+EXCEPTION WHEN duplicate_column THEN NULL; END $$;
+
+DO $$ BEGIN
+  ALTER TABLE license_devices ADD COLUMN last_ip       INET;
+EXCEPTION WHEN duplicate_column THEN NULL; END $$;
+
+DO $$ BEGIN
+  ALTER TABLE license_devices ADD COLUMN last_city     TEXT;
+EXCEPTION WHEN duplicate_column THEN NULL; END $$;
+
+DO $$ BEGIN
+  ALTER TABLE license_devices ADD COLUMN last_country  TEXT;
+EXCEPTION WHEN duplicate_column THEN NULL; END $$;
+
+DO $$ BEGIN
+  ALTER TABLE license_devices ADD COLUMN last_lat      NUMERIC;
+EXCEPTION WHEN duplicate_column THEN NULL; END $$;
+
+DO $$ BEGIN
+  ALTER TABLE license_devices ADD COLUMN last_lon      NUMERIC;
+EXCEPTION WHEN duplicate_column THEN NULL; END $$;

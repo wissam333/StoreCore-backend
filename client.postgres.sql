@@ -173,3 +173,19 @@ ALTER TABLE order_items    DISABLE ROW LEVEL SECURITY;
 ALTER TABLE order_payments DISABLE ROW LEVEL SECURITY;
 ALTER TABLE dues           DISABLE ROW LEVEL SECURITY;
 ALTER TABLE sync_log       DISABLE ROW LEVEL SECURITY;
+
+
+CREATE OR REPLACE FUNCTION adjust_stock(p_product_id TEXT, p_delta INTEGER)
+RETURNS void AS $$
+  UPDATE products
+  SET stock = GREATEST(0, stock + p_delta),
+      updated_at = NOW(),
+      version = version + 1
+  WHERE id = p_product_id;
+$$ LANGUAGE sql;
+
+
+-- Example for seed endpoint :
+--   Invoke-WebRequest -Uri "https://storecore-backend.onrender.com/admin/seed-supabase/TEST-0002-SYNC-KEY" `
+--   -Method POST `
+--   -Headers @{ "x-admin-secret" = "wnajjom321"; "Content-Type" = "application/json" }

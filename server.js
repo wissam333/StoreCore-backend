@@ -5,6 +5,7 @@ dotenv.config();
 import express from "express";
 import pg from "pg";
 import cors from "cors";
+import geoip from "geoip-lite";
 
 const { Pool } = pg;
 const app = express();
@@ -17,6 +18,25 @@ const pool = new Pool({
   password: process.env.DB_PASS,
   ssl: { rejectUnauthorized: false },
 });
+
+// ── Client IP + geo helper ─────────────────────────────────────────────────
+const getClientInfo = (req) => {
+  const ip =
+    (req.headers["x-forwarded-for"] ?? "").split(",")[0]?.trim() ||
+    req.socket.remoteAddress ||
+    null;
+  let city = null, country = null, lat = null, lon = null;
+  if (ip) {
+    const geo = geoip.lookup(ip.replace(/^::ffff:/, ""));
+    if (geo) {
+      city = geo.city ?? null;
+      country = geo.country ?? null;
+      lat = geo.ll?.[0] ?? null;
+      lon = geo.ll?.[1] ?? null;
+    }
+  }
+  return { ip, city, country, lat, lon };
+};
 
 app.use(
   cors({
@@ -66,11 +86,13 @@ app.get("/health", (_req, res) =>
 // ── LICENSE ENDPOINTS ─────────────────────────────────────────────────────────
 
 app.post("/license/activate", async (req, res) => {
-  const { key, machine_id, platform, label } = req.body;
+  const { key, machine_id, platform, label, device_model, os_version, app_version } = req.body;
   if (!key || !machine_id || !platform)
     return res
       .status(400)
       .json({ ok: false, error: "Missing key, machine_id or platform" });
+
+  const ci = getClientInfo(req);
 
   try {
     const { rows: licRows } = await pool.query(
@@ -92,9 +114,18 @@ app.post("/license/activate", async (req, res) => {
 
     if (existing.length > 0) {
       await pool.query(
-        `UPDATE license_devices SET last_seen_at = NOW(), platform = $1
-         WHERE license_key = $2 AND machine_id = $3`,
-        [platform, key, machine_id],
+        `UPDATE license_devices SET last_seen_at = NOW(), platform = $1,
+            device_model = COALESCE($2, device_model),
+            os_version   = COALESCE($3, os_version),
+            app_version  = COALESCE($4, app_version),
+            last_ip      = $5,
+            last_city    = COALESCE($6, last_city),
+            last_country = COALESCE($7, last_country),
+            last_lat     = COALESCE($8, last_lat),
+            last_lon     = COALESCE($9, last_lon)
+         WHERE license_key = $10 AND machine_id = $11`,
+        [platform, device_model ?? null, os_version ?? null, app_version ?? null,
+         ci.ip, ci.city, ci.country, ci.lat, ci.lon, key, machine_id],
       );
       return res.json({
         ok: true,
@@ -125,10 +156,23 @@ app.post("/license/activate", async (req, res) => {
     }
 
     await pool.query(
-      `INSERT INTO license_devices (license_key, machine_id, platform, label)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (license_key, machine_id) DO UPDATE SET last_seen_at = NOW()`,
-      [key, machine_id, platform, label ?? null],
+      `INSERT INTO license_devices
+         (license_key, machine_id, platform, label, device_model, os_version, app_version, last_ip, last_city, last_country, last_lat, last_lon)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       ON CONFLICT (license_key, machine_id) DO UPDATE SET
+         last_seen_at = NOW(),
+         platform     = COALESCE($3,  license_devices.platform),
+         device_model = COALESCE($5,  license_devices.device_model),
+         os_version   = COALESCE($6,  license_devices.os_version),
+         app_version  = COALESCE($7,  license_devices.app_version),
+         last_ip      = $8,
+         last_city    = COALESCE($9,  license_devices.last_city),
+         last_country = COALESCE($10, license_devices.last_country),
+         last_lat     = COALESCE($11, license_devices.last_lat),
+         last_lon     = COALESCE($12, license_devices.last_lon)`,
+      [key, machine_id, platform, label ?? null,
+       device_model ?? null, os_version ?? null, app_version ?? null,
+       ci.ip, ci.city, ci.country, ci.lat, ci.lon],
     );
 
     return res.json({
@@ -148,9 +192,11 @@ app.post("/license/activate", async (req, res) => {
 });
 
 app.post("/license/verify", async (req, res) => {
-  const { key, machine_id, platform } = req.body;
+  const { key, machine_id, platform, device_model, os_version, app_version } = req.body;
   if (!key || !machine_id || !platform)
     return res.status(400).json({ ok: false, error: "Missing fields" });
+
+  const ci = getClientInfo(req);
 
   try {
     const { rows: licRows } = await pool.query(
@@ -179,9 +225,20 @@ app.post("/license/verify", async (req, res) => {
     }
 
     await pool.query(
-      `UPDATE license_devices SET last_seen_at = NOW()
+      `UPDATE license_devices SET last_seen_at = NOW(),
+          platform     = COALESCE($3,  license_devices.platform),
+          device_model = COALESCE($4,  license_devices.device_model),
+          os_version   = COALESCE($5,  license_devices.os_version),
+          app_version  = COALESCE($6,  license_devices.app_version),
+          last_ip      = $7,
+          last_city    = COALESCE($8,  license_devices.last_city),
+          last_country = COALESCE($9,  license_devices.last_country),
+          last_lat     = COALESCE($10, license_devices.last_lat),
+          last_lon     = COALESCE($11, license_devices.last_lon)
        WHERE license_key = $1 AND machine_id = $2`,
-      [key, machine_id],
+      [key, machine_id, platform ?? null,
+       device_model ?? null, os_version ?? null, app_version ?? null,
+       ci.ip, ci.city, ci.country, ci.lat, ci.lon],
     );
     await pool.query(
       `UPDATE licenses SET last_verified_at = NOW() WHERE key = $1`,
