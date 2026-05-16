@@ -86,13 +86,14 @@ app.get("/health", (_req, res) =>
 // ── LICENSE ENDPOINTS ─────────────────────────────────────────────────────────
 
 app.post("/license/activate", async (req, res) => {
-  const { key, machine_id, platform, label, device_model, os_version, app_version } = req.body;
+  const { key, machine_id, platform, label, device_model, os_version, app_version, lat, lon } = req.body;
   if (!key || !machine_id || !platform)
     return res
       .status(400)
       .json({ ok: false, error: "Missing key, machine_id or platform" });
 
-  const ci = getClientInfo(req);
+  let ci = getClientInfo(req);
+  if (lat != null && lon != null) { ci.lat = lat; ci.lon = lon; }
 
   try {
     const { rows: licRows } = await pool.query(
@@ -192,11 +193,12 @@ app.post("/license/activate", async (req, res) => {
 });
 
 app.post("/license/verify", async (req, res) => {
-  const { key, machine_id, platform, device_model, os_version, app_version } = req.body;
+  const { key, machine_id, platform, device_model, os_version, app_version, lat, lon } = req.body;
   if (!key || !machine_id || !platform)
     return res.status(400).json({ ok: false, error: "Missing fields" });
 
-  const ci = getClientInfo(req);
+  let ci = getClientInfo(req);
+  if (lat != null && lon != null) { ci.lat = lat; ci.lon = lon; }
 
   try {
     const { rows: licRows } = await pool.query(
@@ -295,11 +297,30 @@ const adminAuth = (req, res, next) => {
   next();
 };
 
-// List all licenses with device counts
+// List all licenses with device counts and location data
 app.get("/admin/licenses", adminAuth, async (_req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT l.*, COUNT(d.id) as used_slots
+      SELECT l.*, COUNT(d.id) as used_slots,
+        COALESCE(
+          jsonb_agg(
+            jsonb_build_object(
+              'machine_id', d.machine_id,
+              'platform', d.platform,
+              'label', d.label,
+              'device_model', d.device_model,
+              'os_version', d.os_version,
+              'app_version', d.app_version,
+              'last_lat', d.last_lat,
+              'last_lon', d.last_lon,
+              'last_city', d.last_city,
+              'last_country', d.last_country,
+              'activated_at', d.activated_at,
+              'last_seen_at', d.last_seen_at
+            )
+          ) FILTER (WHERE d.id IS NOT NULL),
+          '[]'::jsonb
+        ) as devices
       FROM licenses l
       LEFT JOIN license_devices d ON d.license_key = l.key
       GROUP BY l.key
