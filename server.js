@@ -400,6 +400,10 @@ app.delete("/admin/licenses/:key/devices", adminAuth, async (req, res) => {
 
 // ── Seed a customer's Supabase project ────────────────────────────────────────
 // Call once per new sync customer after creating their Supabase project.
+// ── Init + Seed a customer's Supabase project ─────────────────────────────────
+// Call once per new sync customer after creating their Supabase project.
+// Creates all tables, indexes, and seeds default roles + admin staff.
+// Safe to call again — uses IF NOT EXISTS + ON CONFLICT DO NOTHING.
 app.post("/admin/seed-supabase/:key", adminAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -414,11 +418,221 @@ app.post("/admin/seed-supabase/:key", adminAuth, async (req, res) => {
         .status(400)
         .json({ ok: false, error: "License has no Supabase config" });
 
-    const base = `${lic.supabase_url}/rest/v1`;
+    const supabaseUrl = lic.supabase_url;
+    const supabaseKey = lic.supabase_key;
+
+    // ── Step 1: Create schema via Supabase SQL endpoint ───────────────────────
+    // Supabase exposes a /rest/v1/rpc endpoint for custom functions,
+    // but for raw DDL we use the management API or the pg connection.
+    // Simplest: connect directly to the customer's Supabase Postgres.
+    // We do this via a temp Pool using the Supabase connection string.
+    // Supabase DB host format: db.<project-ref>.supabase.co
+    const projectRef = supabaseUrl.replace("https://", "").split(".")[0];
+    const customerPool = new Pool({
+      host: `db.${projectRef}.supabase.co`,
+      port: 5432,
+      database: "postgres",
+      user: "postgres",
+      password: supabaseKey, // service_role key IS the postgres password on Supabase
+      ssl: { rejectUnauthorized: false },
+      connectionTimeoutMillis: 15000,
+    });
+
+    try {
+      await customerPool.query(`
+        -- Categories
+        CREATE TABLE IF NOT EXISTS categories (
+          id          TEXT          PRIMARY KEY,
+          name        TEXT          NOT NULL,
+          description TEXT,
+          version     INTEGER       NOT NULL DEFAULT 1,
+          created_at  TIMESTAMPTZ   DEFAULT NOW(),
+          updated_at  TIMESTAMPTZ   DEFAULT NOW(),
+          synced_at   TIMESTAMPTZ
+        );
+
+        -- Products
+        CREATE TABLE IF NOT EXISTS products (
+          id           TEXT          PRIMARY KEY,
+          name         TEXT          NOT NULL,
+          description  TEXT,
+          category_id  TEXT          REFERENCES categories(id) ON DELETE SET NULL,
+          barcode      TEXT,
+          buy_price    NUMERIC(14,4) NOT NULL DEFAULT 0,
+          sell_price   NUMERIC(14,4) NOT NULL DEFAULT 0,
+          currency     TEXT          NOT NULL DEFAULT 'SP',
+          stock        INTEGER       NOT NULL DEFAULT 0,
+          min_stock    INTEGER       DEFAULT 0,
+          unit         TEXT          DEFAULT 'piece',
+          image_url    TEXT,
+          is_active    BOOLEAN       DEFAULT TRUE,
+          version      INTEGER       NOT NULL DEFAULT 1,
+          created_at   TIMESTAMPTZ   DEFAULT NOW(),
+          updated_at   TIMESTAMPTZ   DEFAULT NOW(),
+          synced_at    TIMESTAMPTZ
+        );
+
+        -- Customers
+        CREATE TABLE IF NOT EXISTS customers (
+          id           TEXT          PRIMARY KEY,
+          name         TEXT          NOT NULL,
+          phone        TEXT,
+          address      TEXT,
+          notes        TEXT,
+          total_orders INTEGER       DEFAULT 0,
+          total_spent  NUMERIC(14,4) DEFAULT 0,
+          last_order   TIMESTAMPTZ,
+          version      INTEGER       NOT NULL DEFAULT 1,
+          created_at   TIMESTAMPTZ   DEFAULT NOW(),
+          updated_at   TIMESTAMPTZ   DEFAULT NOW(),
+          synced_at    TIMESTAMPTZ
+        );
+
+        -- Roles
+        CREATE TABLE IF NOT EXISTS roles (
+          id          TEXT          PRIMARY KEY,
+          name        TEXT          NOT NULL,
+          permissions JSONB         NOT NULL DEFAULT '{}',
+          is_system   BOOLEAN       DEFAULT FALSE,
+          version     INTEGER       NOT NULL DEFAULT 1,
+          created_at  TIMESTAMPTZ   DEFAULT NOW(),
+          updated_at  TIMESTAMPTZ   DEFAULT NOW(),
+          synced_at   TIMESTAMPTZ
+        );
+
+        -- Staff
+        CREATE TABLE IF NOT EXISTS staff (
+          id          TEXT          PRIMARY KEY,
+          full_name   TEXT          NOT NULL,
+          username    TEXT,
+          password    TEXT,
+          pin         TEXT,
+          role_id     TEXT          REFERENCES roles(id) ON DELETE SET NULL,
+          role        TEXT,
+          phone       TEXT,
+          email       TEXT,
+          is_active   BOOLEAN       DEFAULT TRUE,
+          last_login  TIMESTAMPTZ,
+          version     INTEGER       NOT NULL DEFAULT 1,
+          created_at  TIMESTAMPTZ   DEFAULT NOW(),
+          updated_at  TIMESTAMPTZ   DEFAULT NOW(),
+          synced_at   TIMESTAMPTZ
+        );
+
+        -- Orders
+        CREATE TABLE IF NOT EXISTS orders (
+          id               TEXT          PRIMARY KEY,
+          customer_id      TEXT          REFERENCES customers(id) ON DELETE SET NULL,
+          order_date       TIMESTAMPTZ   DEFAULT NOW(),
+          status           TEXT          NOT NULL DEFAULT 'pending',
+          total_sp         NUMERIC(14,4) DEFAULT 0,
+          total_usd        NUMERIC(14,4) DEFAULT 0,
+          paid_amount      NUMERIC(14,4) DEFAULT 0,
+          display_currency TEXT          DEFAULT 'SP',
+          notes            TEXT,
+          created_by       TEXT          REFERENCES staff(id) ON DELETE SET NULL,
+          version          INTEGER       NOT NULL DEFAULT 1,
+          created_at       TIMESTAMPTZ   DEFAULT NOW(),
+          updated_at       TIMESTAMPTZ   DEFAULT NOW(),
+          synced_at        TIMESTAMPTZ
+        );
+
+        -- Order Items
+        CREATE TABLE IF NOT EXISTS order_items (
+          id                  TEXT          PRIMARY KEY,
+          order_id            TEXT          NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+          product_id          TEXT          REFERENCES products(id) ON DELETE SET NULL,
+          product_name        TEXT          NOT NULL,
+          quantity            INTEGER       NOT NULL DEFAULT 1,
+          sell_price_at_sale  NUMERIC(14,4) NOT NULL,
+          currency_at_sale    TEXT          NOT NULL DEFAULT 'SP',
+          line_total_sp       NUMERIC(14,4) NOT NULL DEFAULT 0,
+          version             INTEGER       NOT NULL DEFAULT 1,
+          created_at          TIMESTAMPTZ   DEFAULT NOW(),
+          updated_at          TIMESTAMPTZ   DEFAULT NOW(),
+          synced_at           TIMESTAMPTZ
+        );
+
+        -- Order Payments
+        CREATE TABLE IF NOT EXISTS order_payments (
+          id          TEXT          PRIMARY KEY,
+          order_id    TEXT          NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+          amount      NUMERIC(14,4) NOT NULL,
+          currency    TEXT          NOT NULL DEFAULT 'SP',
+          amount_sp   NUMERIC(14,4) NOT NULL DEFAULT 0,
+          note        TEXT,
+          paid_at     TIMESTAMPTZ   DEFAULT NOW(),
+          version     INTEGER       NOT NULL DEFAULT 1,
+          created_at  TIMESTAMPTZ   DEFAULT NOW(),
+          updated_at  TIMESTAMPTZ   DEFAULT NOW(),
+          synced_at   TIMESTAMPTZ
+        );
+
+        -- Dues
+        CREATE TABLE IF NOT EXISTS dues (
+          id           TEXT          PRIMARY KEY,
+          customer_id  TEXT          REFERENCES customers(id) ON DELETE SET NULL,
+          order_id     TEXT          REFERENCES orders(id)    ON DELETE SET NULL,
+          amount       NUMERIC(14,4) NOT NULL,
+          currency     TEXT          NOT NULL DEFAULT 'SP',
+          amount_sp    NUMERIC(14,4) NOT NULL DEFAULT 0,
+          description  TEXT,
+          due_date     TEXT,
+          paid         BOOLEAN       DEFAULT FALSE,
+          paid_at      TIMESTAMPTZ,
+          version      INTEGER       NOT NULL DEFAULT 1,
+          created_at   TIMESTAMPTZ   DEFAULT NOW(),
+          updated_at   TIMESTAMPTZ   DEFAULT NOW(),
+          synced_at    TIMESTAMPTZ
+        );
+
+        -- Sync log — tracks which device changed which fields
+        -- Used for field-level merge conflict resolution across devices
+        CREATE TABLE IF NOT EXISTS sync_log (
+          id            BIGSERIAL     PRIMARY KEY,
+          table_name    TEXT          NOT NULL,
+          row_id        TEXT          NOT NULL,
+          device_id     TEXT          NOT NULL,
+          changed_fields TEXT[]       NOT NULL DEFAULT '{}',
+          updated_at    TIMESTAMPTZ   DEFAULT NOW()
+        );
+
+        -- Indexes
+        CREATE INDEX IF NOT EXISTS idx_categories_updated_at     ON categories(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_products_updated_at       ON products(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_customers_updated_at      ON customers(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_orders_updated_at         ON orders(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_order_items_updated_at    ON order_items(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_order_payments_updated_at ON order_payments(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_dues_updated_at           ON dues(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_roles_updated_at          ON roles(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_staff_updated_at          ON staff(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_sync_log_updated_at       ON sync_log(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_sync_log_table_row        ON sync_log(table_name, row_id);
+
+        -- Disable RLS on all tables (service_role key bypasses anyway,
+        -- but this avoids issues if Supabase defaults change)
+        ALTER TABLE categories     DISABLE ROW LEVEL SECURITY;
+        ALTER TABLE products       DISABLE ROW LEVEL SECURITY;
+        ALTER TABLE customers      DISABLE ROW LEVEL SECURITY;
+        ALTER TABLE roles          DISABLE ROW LEVEL SECURITY;
+        ALTER TABLE staff          DISABLE ROW LEVEL SECURITY;
+        ALTER TABLE orders         DISABLE ROW LEVEL SECURITY;
+        ALTER TABLE order_items    DISABLE ROW LEVEL SECURITY;
+        ALTER TABLE order_payments DISABLE ROW LEVEL SECURITY;
+        ALTER TABLE dues           DISABLE ROW LEVEL SECURITY;
+        ALTER TABLE sync_log       DISABLE ROW LEVEL SECURITY;
+      `);
+    } finally {
+      await customerPool.end();
+    }
+
+    // ── Step 2: Seed via PostgREST ─────────────────────────────────────────────
+    const base = `${supabaseUrl}/rest/v1`;
     const headers = {
       "Content-Type": "application/json",
-      apikey: lic.supabase_key,
-      Authorization: `Bearer ${lic.supabase_key}`,
+      apikey: supabaseKey,
+      Authorization: `Bearer ${supabaseKey}`,
       Prefer: "resolution=merge-duplicates,return=minimal",
     };
 
@@ -478,7 +692,6 @@ app.post("/admin/seed-supabase/:key", adminAuth, async (req, res) => {
       "staff.delete": false,
     };
 
-    // Seed roles
     const rolesRes = await fetch(`${base}/roles`, {
       method: "POST",
       headers,
@@ -506,7 +719,6 @@ app.post("/admin/seed-supabase/:key", adminAuth, async (req, res) => {
       throw new Error(`Roles seed failed: ${JSON.stringify(err)}`);
     }
 
-    // Seed admin staff
     const staffRes = await fetch(`${base}/staff`, {
       method: "POST",
       headers,
@@ -520,7 +732,6 @@ app.post("/admin/seed-supabase/:key", adminAuth, async (req, res) => {
           role: "Administrator",
           is_active: true,
           version: 1,
-          _deleted: false,
         },
       ]),
     });
@@ -529,7 +740,10 @@ app.post("/admin/seed-supabase/:key", adminAuth, async (req, res) => {
       throw new Error(`Staff seed failed: ${JSON.stringify(err)}`);
     }
 
-    res.json({ ok: true, message: "Supabase seeded successfully" });
+    res.json({
+      ok: true,
+      message: "Schema created and Supabase seeded successfully",
+    });
   } catch (err) {
     console.error("/admin/seed-supabase:", err.message);
     res.status(500).json({ ok: false, error: err.message });

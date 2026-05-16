@@ -241,6 +241,19 @@ UPDATE orders SET created_by = 'staff-0001-0000-0000-000000000001' WHERE created
 
 CREATE INDEX IF NOT EXISTS idx_orders_created_by ON orders(created_by);
 
+
+CREATE TABLE IF NOT EXISTS sync_log (
+  id            BIGSERIAL PRIMARY KEY,
+  table_name    TEXT        NOT NULL,
+  row_id        TEXT        NOT NULL,
+  changed_fields JSONB      NOT NULL DEFAULT '[]',
+  device_id     TEXT,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_sync_log_updated_at ON sync_log (updated_at);
+CREATE INDEX idx_sync_log_row       ON sync_log (table_name, row_id);
+
 -- ─────────────────────────────────────────────────────────────────────────────
 --  LICENSES  (matches server.js column names)
 -- ─────────────────────────────────────────────────────────────────────────────
