@@ -5,7 +5,6 @@ dotenv.config();
 import express from "express";
 import pg from "pg";
 import cors from "cors";
-import geoip from "geoip-lite";
 
 const { Pool } = pg;
 const app = express();
@@ -20,19 +19,37 @@ const pool = new Pool({
 });
 
 // ── Client IP + geo helper ─────────────────────────────────────────────────
-const getClientInfo = (req) => {
+// Simple in-memory IP geo cache (1 hour TTL)
+const geoCache = new Map();
+const GEO_TTL = 3600000;
+
+const getClientInfo = async (req) => {
   const ip =
     (req.headers["x-forwarded-for"] ?? "").split(",")[0]?.trim() ||
     req.socket.remoteAddress ||
     null;
   let city = null, country = null, lat = null, lon = null;
   if (ip) {
-    const geo = geoip.lookup(ip.replace(/^::ffff:/, ""));
-    if (geo) {
-      city = geo.city ?? null;
-      country = geo.country ?? null;
-      lat = geo.ll?.[0] ?? null;
-      lon = geo.ll?.[1] ?? null;
+    const cleanIp = ip.replace(/^::ffff:/, "");
+    const cached = geoCache.get(cleanIp);
+    if (cached && Date.now() - cached.ts < GEO_TTL) {
+      return { ip: cleanIp, ...cached.data };
+    }
+    try {
+      const res = await fetch(
+        `http://ip-api.com/json/${cleanIp}?fields=status,lat,lon,city,country`,
+        { signal: AbortSignal.timeout(3000) },
+      );
+      const data = await res.json();
+      if (data.status === "success") {
+        city = data.city ?? null;
+        country = data.country ?? null;
+        lat = data.lat ?? null;
+        lon = data.lon ?? null;
+        geoCache.set(cleanIp, { ts: Date.now(), data: { city, country, lat, lon } });
+      }
+    } catch {
+      // IP geo failed silently — coords stay null
     }
   }
   return { ip, city, country, lat, lon };
@@ -85,26 +102,22 @@ app.get("/health", (_req, res) =>
 
 // ── LICENSE ENDPOINTS ─────────────────────────────────────────────────────────
 
+// ── ACTIVATE ─────────────────────────────────────────────────────────────────
 app.post("/license/activate", async (req, res) => {
   const { key, machine_id, platform, label, device_model, os_version, app_version, lat, lon } = req.body;
   if (!key || !machine_id || !platform)
-    return res
-      .status(400)
-      .json({ ok: false, error: "Missing key, machine_id or platform" });
+    return res.status(400).json({ ok: false, error: "Missing key, machine_id or platform" });
 
-  let ci = getClientInfo(req);
+  let ci = await getClientInfo(req);
   if (lat != null && lon != null) { ci.lat = lat; ci.lon = lon; }
 
   try {
     const { rows: licRows } = await pool.query(
-      `SELECT * FROM licenses WHERE key = $1`,
-      [key],
+      `SELECT * FROM licenses WHERE key = $1`, [key],
     );
     const lic = licRows[0];
-    if (!lic)
-      return res.status(404).json({ ok: false, error: "Invalid license key" });
-    if (!lic.is_active)
-      return res.status(403).json({ ok: false, error: "License deactivated" });
+    if (!lic) return res.status(404).json({ ok: false, error: "Invalid license key" });
+    if (!lic.is_active) return res.status(403).json({ ok: false, error: "License deactivated" });
     if (lic.expires_at && new Date(lic.expires_at) < new Date())
       return res.status(403).json({ ok: false, error: "License expired" });
 
@@ -140,21 +153,16 @@ app.post("/license/activate", async (req, res) => {
     }
 
     const { rows: countRows } = await pool.query(
-      `SELECT COUNT(*) as n FROM license_devices WHERE license_key = $1`,
-      [key],
+      `SELECT COUNT(*) as n FROM license_devices WHERE license_key = $1`, [key],
     );
     const usedSlots = parseInt(countRows[0].n);
     const maxDevices = lic.max_devices ?? 2;
-
-    if (usedSlots >= maxDevices) {
+    if (usedSlots >= maxDevices)
       return res.status(403).json({
         ok: false,
         error: `All ${maxDevices} device slots are used. Contact support to add more slots or deactivate an existing device.`,
-        reason: "slots_full",
-        used: usedSlots,
-        max: maxDevices,
+        reason: "slots_full", used: usedSlots, max: maxDevices,
       });
-    }
 
     await pool.query(
       `INSERT INTO license_devices
@@ -183,8 +191,6 @@ app.post("/license/activate", async (req, res) => {
       ...(lic.sync_enabled && lic.supabase_url
         ? { supabase_url: lic.supabase_url, supabase_key: lic.supabase_key }
         : {}),
-      used: usedSlots + 1,
-      max: maxDevices,
     });
   } catch (err) {
     console.error("/license/activate:", err.message);
@@ -192,24 +198,22 @@ app.post("/license/activate", async (req, res) => {
   }
 });
 
+// ── VERIFY ───────────────────────────────────────────────────────────────────
 app.post("/license/verify", async (req, res) => {
   const { key, machine_id, platform, device_model, os_version, app_version, lat, lon } = req.body;
   if (!key || !machine_id || !platform)
     return res.status(400).json({ ok: false, error: "Missing fields" });
 
-  let ci = getClientInfo(req);
+  let ci = await getClientInfo(req);
   if (lat != null && lon != null) { ci.lat = lat; ci.lon = lon; }
 
   try {
     const { rows: licRows } = await pool.query(
-      `SELECT * FROM licenses WHERE key = $1`,
-      [key],
+      `SELECT * FROM licenses WHERE key = $1`, [key],
     );
     const lic = licRows[0];
-    if (!lic)
-      return res.status(404).json({ ok: false, error: "Invalid license key" });
-    if (!lic.is_active)
-      return res.status(403).json({ ok: false, error: "License deactivated" });
+    if (!lic) return res.status(404).json({ ok: false, error: "Invalid license key" });
+    if (!lic.is_active) return res.status(403).json({ ok: false, error: "License deactivated" });
     if (lic.expires_at && new Date(lic.expires_at) < new Date())
       return res.status(403).json({ ok: false, error: "License expired" });
 
@@ -217,14 +221,8 @@ app.post("/license/verify", async (req, res) => {
       `SELECT * FROM license_devices WHERE license_key = $1 AND machine_id = $2`,
       [key, machine_id],
     );
-
-    if (deviceRows.length === 0) {
-      return res.status(403).json({
-        ok: false,
-        error: "This device is not activated. Please enter your license key.",
-        reason: "not_activated",
-      });
-    }
+    if (deviceRows.length === 0)
+      return res.status(403).json({ ok: false, error: "This device is not activated. Please enter your license key.", reason: "not_activated" });
 
     await pool.query(
       `UPDATE license_devices SET last_seen_at = NOW(),
@@ -242,10 +240,7 @@ app.post("/license/verify", async (req, res) => {
        device_model ?? null, os_version ?? null, app_version ?? null,
        ci.ip, ci.city, ci.country, ci.lat, ci.lon],
     );
-    await pool.query(
-      `UPDATE licenses SET last_verified_at = NOW() WHERE key = $1`,
-      [key],
-    );
+    await pool.query(`UPDATE licenses SET last_verified_at = NOW() WHERE key = $1`, [key]);
 
     return res.json({
       ok: true,
