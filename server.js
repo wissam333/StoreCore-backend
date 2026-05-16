@@ -442,6 +442,41 @@ app.patch("/admin/licenses/:key", adminAuth, async (req, res) => {
   }
 });
 
+// Locate a device by IP (trigger IP geolocation for a device that has last_ip but no coords)
+app.post("/admin/devices/:machine_id/locate", adminAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT last_ip FROM license_devices WHERE machine_id = $1`,
+      [req.params.machine_id],
+    );
+    if (!rows[0] || !rows[0].last_ip)
+      return res.status(400).json({ ok: false, error: "Device has no IP address" });
+
+    const ip = rows[0].last_ip.replace(/^::ffff:/, "");
+    const geoRes = await fetch(
+      `http://ip-api.com/json/${ip}?fields=status,lat,lon,city,country`,
+      { signal: AbortSignal.timeout(5000) },
+    );
+    const data = await geoRes.json();
+    if (data.status !== "success")
+      return res.status(400).json({ ok: false, error: "IP geolocation failed" });
+
+    await pool.query(
+      `UPDATE license_devices SET
+        last_city    = COALESCE($1, last_city),
+        last_country = COALESCE($2, last_country),
+        last_lat     = COALESCE($3, last_lat),
+        last_lon     = COALESCE($4, last_lon)
+       WHERE machine_id = $5`,
+      [data.city, data.country, data.lat, data.lon, req.params.machine_id],
+    );
+
+    res.json({ ok: true, lat: data.lat, lon: data.lon, city: data.city, country: data.country });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // Revoke a specific device slot
 app.delete(
   "/admin/licenses/:key/devices/:machine_id",
