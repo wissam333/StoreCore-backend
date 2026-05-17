@@ -1,8 +1,8 @@
 -- client.postgres.sql
--- PostgreSQL schema for a new client database.
--- Copy + paste into the remote Supabase/Postgres SQL editor to initialise a new client.
--- Mirrors the schema in my-app/db/schema.js exactly.
--- Columns prefixed with _deleted support soft-delete; synced_at for sync tracking.
+-- PostgreSQL schema for a new client database (Supabase).
+-- Run this in your Supabase SQL editor to create all tables for sync.
+-- Note: _deleted and synced_at columns are NOT included here —
+-- they are local-only (SQLite) concepts and stripped by the sync engine.
 --
 -- Fixed seed IDs (must match the app's schema.js):
 --   Administrator role : role-0001-0000-0000-000000000001
@@ -19,9 +19,7 @@ CREATE TABLE IF NOT EXISTS categories (
   description TEXT,
   version     INTEGER NOT NULL DEFAULT 1,
   created_at  TIMESTAMPTZ DEFAULT NOW(),
-  updated_at  TIMESTAMPTZ DEFAULT NOW(),
-  _deleted    INTEGER DEFAULT 0,
-  synced_at   TIMESTAMPTZ
+  updated_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS products (
@@ -40,9 +38,7 @@ CREATE TABLE IF NOT EXISTS products (
   is_active    INTEGER DEFAULT 1,
   version      INTEGER NOT NULL DEFAULT 1,
   created_at   TIMESTAMPTZ DEFAULT NOW(),
-  updated_at   TIMESTAMPTZ DEFAULT NOW(),
-  _deleted     INTEGER DEFAULT 0,
-  synced_at    TIMESTAMPTZ
+  updated_at   TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS customers (
@@ -56,9 +52,7 @@ CREATE TABLE IF NOT EXISTS customers (
   last_order   TIMESTAMPTZ,
   version      INTEGER NOT NULL DEFAULT 1,
   created_at   TIMESTAMPTZ DEFAULT NOW(),
-  updated_at   TIMESTAMPTZ DEFAULT NOW(),
-  _deleted     INTEGER DEFAULT 0,
-  synced_at    TIMESTAMPTZ
+  updated_at   TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -75,9 +69,7 @@ CREATE TABLE IF NOT EXISTS orders (
   created_by       TEXT    REFERENCES staff(id),
   version          INTEGER NOT NULL DEFAULT 1,
   created_at       TIMESTAMPTZ DEFAULT NOW(),
-  updated_at       TIMESTAMPTZ DEFAULT NOW(),
-  _deleted         INTEGER DEFAULT 0,
-  synced_at        TIMESTAMPTZ
+  updated_at       TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS order_items (
@@ -92,9 +84,7 @@ CREATE TABLE IF NOT EXISTS order_items (
   line_total_sp       NUMERIC NOT NULL DEFAULT 0,
   version             INTEGER NOT NULL DEFAULT 1,
   created_at          TIMESTAMPTZ DEFAULT NOW(),
-  updated_at          TIMESTAMPTZ DEFAULT NOW(),
-  _deleted            INTEGER DEFAULT 0,
-  synced_at           TIMESTAMPTZ
+  updated_at          TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS order_payments (
@@ -107,9 +97,7 @@ CREATE TABLE IF NOT EXISTS order_payments (
   paid_at     TIMESTAMPTZ DEFAULT NOW(),
   version     INTEGER NOT NULL DEFAULT 1,
   created_at  TIMESTAMPTZ DEFAULT NOW(),
-  updated_at  TIMESTAMPTZ DEFAULT NOW(),
-  _deleted    INTEGER DEFAULT 0,
-  synced_at   TIMESTAMPTZ
+  updated_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS dues (
@@ -127,27 +115,23 @@ CREATE TABLE IF NOT EXISTS dues (
   contact_name TEXT,
   version     INTEGER NOT NULL DEFAULT 1,
   created_at  TIMESTAMPTZ DEFAULT NOW(),
-  updated_at  TIMESTAMPTZ DEFAULT NOW(),
-  _deleted    INTEGER DEFAULT 0,
-  synced_at   TIMESTAMPTZ
+  updated_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS roles (
   id          TEXT    PRIMARY KEY,
-  name        TEXT    NOT NULL,
+  name        TEXT    NOT NULL UNIQUE,
   permissions TEXT    NOT NULL DEFAULT '{}',
   is_system   INTEGER DEFAULT 0,
   version     INTEGER NOT NULL DEFAULT 1,
   created_at  TIMESTAMPTZ DEFAULT NOW(),
-  updated_at  TIMESTAMPTZ DEFAULT NOW(),
-  _deleted    INTEGER DEFAULT 0,
-  synced_at   TIMESTAMPTZ
+  updated_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS staff (
   id          TEXT    PRIMARY KEY,
   full_name   TEXT    NOT NULL,
-  username    TEXT,
+  username    TEXT    UNIQUE,
   password    TEXT,
   pin         TEXT,
   role_id     TEXT    REFERENCES roles(id),
@@ -158,9 +142,7 @@ CREATE TABLE IF NOT EXISTS staff (
   last_login  TIMESTAMPTZ,
   version     INTEGER NOT NULL DEFAULT 1,
   created_at  TIMESTAMPTZ DEFAULT NOW(),
-  updated_at  TIMESTAMPTZ DEFAULT NOW(),
-  _deleted    INTEGER DEFAULT 0,
-  synced_at   TIMESTAMPTZ
+  updated_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
@@ -182,9 +164,7 @@ CREATE TABLE IF NOT EXISTS stock_receivings (
   created_by     TEXT    REFERENCES staff(id),
   version        INTEGER NOT NULL DEFAULT 1,
   created_at     TIMESTAMPTZ DEFAULT NOW(),
-  updated_at     TIMESTAMPTZ DEFAULT NOW(),
-  _deleted       INTEGER DEFAULT 0,
-  synced_at      TIMESTAMPTZ
+  updated_at     TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS stock_receiving_items (
@@ -199,9 +179,7 @@ CREATE TABLE IF NOT EXISTS stock_receiving_items (
   is_new_product    INTEGER DEFAULT 0,
   version           INTEGER NOT NULL DEFAULT 1,
   created_at        TIMESTAMPTZ DEFAULT NOW(),
-  updated_at        TIMESTAMPTZ DEFAULT NOW(),
-  _deleted          INTEGER DEFAULT 0,
-  synced_at         TIMESTAMPTZ
+  updated_at        TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════════
@@ -211,6 +189,8 @@ CREATE TABLE IF NOT EXISTS stock_receiving_items (
 CREATE TABLE IF NOT EXISTS settings (
   key        TEXT PRIMARY KEY,
   value      TEXT,
+  version    INTEGER NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -231,44 +211,31 @@ CREATE TABLE IF NOT EXISTS sync_meta (
   value TEXT
 );
 
--- ═══════════════════════════════════════════════════════════════════════════════
---  SETTINGS
--- ═══════════════════════════════════════════════════════════════════════════════
+INSERT INTO settings (key, value) VALUES
+  ('store_name',      'My Store'),
+  ('store_address',   ''),
+  ('store_phone',     ''),
+  ('dollar_rate',     '15000'),
+  ('report_currency', 'SP'),
+  ('sync_base',       ''),
+  ('sync_token',      '')
+ON CONFLICT (key) DO NOTHING;
 
-CREATE TABLE IF NOT EXISTS settings (
-  id         TEXT,
-  key        TEXT PRIMARY KEY,
-  value      TEXT,
-  version    INTEGER NOT NULL DEFAULT 1,
-  _deleted   INTEGER DEFAULT 0,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW(),
-  synced_at  TIMESTAMPTZ
+CREATE TABLE IF NOT EXISTS sync_log (
+  id             BIGSERIAL PRIMARY KEY,
+  table_name     TEXT      NOT NULL,
+  row_id         TEXT      NOT NULL,
+  device_id      TEXT      NOT NULL,
+  changed_fields TEXT[],
+  updated_at     TIMESTAMPTZ DEFAULT NOW()
 );
 
-INSERT OR IGNORE INTO settings (id, key, value, version) VALUES
-  ('settings-store_name',      'store_name',      'My Store', 1),
-  ('settings-store_address',   'store_address',   '',          1),
-  ('settings-store_phone',     'store_phone',     '',          1),
-  ('settings-dollar_rate',     'dollar_rate',     '15000',     1),
-  ('settings-report_currency', 'report_currency', 'SP',        1),
-  ('settings-sync_base',       'sync_base',       '',          1),
-  ('settings-sync_token',      'sync_token',      '',          1);
+CREATE INDEX IF NOT EXISTS idx_sync_log_updated_at ON sync_log (updated_at);
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 --  INDEXES
 -- ═══════════════════════════════════════════════════════════════════════════════
 
--- Partial unique indexes — only active, non-deleted rows must be unique.
--- Deleted rows keep their old username/name so we can soft-delete without collisions.
-CREATE UNIQUE INDEX IF NOT EXISTS staff_username_active_unique
-  ON staff (username) WHERE _deleted = 0;
-
-CREATE UNIQUE INDEX IF NOT EXISTS roles_name_active_unique
-  ON roles (name) WHERE _deleted = 0;
-
-
--- Example for seed endpoint :
---   Invoke-WebRequest -Uri "https://storecore-backend.onrender.com/admin/seed-supabase/TEST-0002-SYNC-KEY" `
---   -Method POST `
---   -Headers @{ "x-admin-secret" = "wnajjom321"; "Content-Type" = "application/json" }
+-- Note: unique indexes on staff/roles use full UNIQUE constraints (defined above
+-- in the CREATE TABLE). Unlike the local SQLite schema, Supabase hard-deletes
+-- rows, so we don't need partial WHERE _deleted = 0 indexes.

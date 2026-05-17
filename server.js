@@ -118,9 +118,6 @@ app.post("/license/activate", licenseLimiter, async (req, res) => {
   const { key, machine_id, platform, label, device_model, os_version, app_version, lat, lon } = req.body;
   if (!key || !machine_id || !platform)
     return res.status(400).json({ ok: false, error: "Missing key, machine_id or platform" });
-  if (!/^[A-F0-9]{8}-[A-F0-9]{8}-[A-F0-9]{8}-[A-F0-9]{8}$/.test(key))
-    return res.status(400).json({ ok: false, error: "Invalid license key format" });
-
   let ci = await getClientInfo(req);
   if (lat != null && lon != null) { ci.lat = lat; ci.lon = lon; }
 
