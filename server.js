@@ -5,6 +5,7 @@ dotenv.config();
 import express from "express";
 import pg from "pg";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
 
 const { Pool } = pg;
 const app = express();
@@ -57,11 +58,21 @@ const getClientInfo = async (req) => {
 
 app.use(
   cors({
+    // origin: "https://your-production-domain.com", // uncomment to restrict
     origin: "*",
     allowedHeaders: ["Content-Type", "Authorization", "x-admin-secret"],
   }),
 );
 app.use(express.json({ limit: "10mb" }));
+
+// ── Rate limiter for license endpoints ──────────────────────────────────────────
+const licenseLimiter = rateLimit({
+  windowMs: 60 * 1000,       // 1 minute window
+  max: 10,                   // 10 requests per minute per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: "Too many requests. Try again later." },
+});
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
 // /health, /license/*, /admin/* all skip Bearer auth
@@ -103,10 +114,12 @@ app.get("/health", (_req, res) =>
 // ── LICENSE ENDPOINTS ─────────────────────────────────────────────────────────
 
 // ── ACTIVATE ─────────────────────────────────────────────────────────────────
-app.post("/license/activate", async (req, res) => {
+app.post("/license/activate", licenseLimiter, async (req, res) => {
   const { key, machine_id, platform, label, device_model, os_version, app_version, lat, lon } = req.body;
   if (!key || !machine_id || !platform)
     return res.status(400).json({ ok: false, error: "Missing key, machine_id or platform" });
+  if (!/^[A-F0-9]{8}-[A-F0-9]{8}-[A-F0-9]{8}-[A-F0-9]{8}$/.test(key))
+    return res.status(400).json({ ok: false, error: "Invalid license key format" });
 
   let ci = await getClientInfo(req);
   if (lat != null && lon != null) { ci.lat = lat; ci.lon = lon; }
@@ -199,7 +212,7 @@ app.post("/license/activate", async (req, res) => {
 });
 
 // ── VERIFY ───────────────────────────────────────────────────────────────────
-app.post("/license/verify", async (req, res) => {
+app.post("/license/verify", licenseLimiter, async (req, res) => {
   const { key, machine_id, platform, device_model, os_version, app_version, lat, lon } = req.body;
   if (!key || !machine_id || !platform)
     return res.status(400).json({ ok: false, error: "Missing fields" });
@@ -256,7 +269,7 @@ app.post("/license/verify", async (req, res) => {
   }
 });
 
-app.post("/license/deactivate", async (req, res) => {
+app.post("/license/deactivate", licenseLimiter, async (req, res) => {
   const { key, machine_id } = req.body;
   if (!key || !machine_id)
     return res

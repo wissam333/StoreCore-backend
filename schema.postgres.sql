@@ -25,6 +25,10 @@ DO $$ BEGIN
   ALTER TABLE licenses ADD COLUMN supabase_key  TEXT;
 EXCEPTION WHEN duplicate_column THEN NULL; END $$;
 
+DO $$ BEGIN
+  ALTER TABLE licenses ADD COLUMN max_devices INTEGER DEFAULT 2;
+EXCEPTION WHEN duplicate_column THEN NULL; END $$;
+
 -- Any existing keys keep sync=false until you explicitly enable it per customer
 UPDATE licenses SET sync_enabled = FALSE WHERE sync_enabled IS NULL;
 
