@@ -100,24 +100,6 @@ CREATE TABLE IF NOT EXISTS order_payments (
   updated_at  TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS dues (
-  id          TEXT    PRIMARY KEY,
-  customer_id TEXT    REFERENCES customers(id),
-  order_id    TEXT    REFERENCES orders(id),
-  amount      NUMERIC NOT NULL,
-  currency    TEXT    NOT NULL DEFAULT 'SP' CHECK(currency IN ('SP','USD')),
-  amount_sp   NUMERIC NOT NULL DEFAULT 0,
-  description TEXT,
-  due_date    TIMESTAMPTZ,
-  paid        INTEGER DEFAULT 0,
-  paid_at     TIMESTAMPTZ,
-  direction   TEXT    NOT NULL DEFAULT 'receivable' CHECK(direction IN ('receivable','payable')),
-  contact_name TEXT,
-  version     INTEGER NOT NULL DEFAULT 1,
-  created_at  TIMESTAMPTZ DEFAULT NOW(),
-  updated_at  TIMESTAMPTZ DEFAULT NOW()
-);
-
 CREATE TABLE IF NOT EXISTS roles (
   id          TEXT    PRIMARY KEY,
   name        TEXT    NOT NULL UNIQUE,
