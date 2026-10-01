@@ -453,6 +453,26 @@ app.patch("/admin/licenses/:key", adminAuth, async (req, res) => {
 });
 
 // Locate a device by IP (trigger IP geolocation for a device that has last_ip but no coords)
+// Permanently delete a license key.
+// license_devices.license_key is REFERENCES licenses(key) ON DELETE CASCADE,
+// so every device row bound to this key is removed with it.
+app.delete("/admin/licenses/:key", adminAuth, async (req, res) => {
+  try {
+    const { rows: devRows } = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM license_devices WHERE license_key = $1`,
+      [req.params.key],
+    );
+    const { rowCount } = await pool.query(`DELETE FROM licenses WHERE key = $1`, [
+      req.params.key,
+    ]);
+    if (!rowCount)
+      return res.status(404).json({ ok: false, error: "License not found" });
+    res.json({ ok: true, key: req.params.key, devices_deleted: devRows[0].n });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.post("/admin/devices/:machine_id/locate", adminAuth, async (req, res) => {
   try {
     const { rows } = await pool.query(
